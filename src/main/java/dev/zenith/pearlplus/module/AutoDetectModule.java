@@ -67,7 +67,7 @@ public class AutoDetectModule extends Module {
     }
 
     public void onTemporaryModeToggle(boolean enabled) {
-        info("PearlPlus Detect temp loader removal " + (enabled ? "enabled" : "disabled"));
+        info("SyntaxPearl detect temp loader removal " + (enabled ? "enabled" : "disabled"));
     }
 
     public void markExistingPearls() {
@@ -226,6 +226,25 @@ public class AutoDetectModule extends Module {
             Optional<StoredPearlEntry> existingStored = findStoredPearlByColumn(target.x(), target.z());
             if (existingStored.isPresent()) {
                 StoredPearlEntry storedPearl = existingStored.get();
+                boolean differentOwner = isDifferentOwner(tracked.owner(), storedPearl.ownerInfo());
+                if (differentOwner) {
+                    info(String.format(
+                            "Transferring chamber at %d %d %d from %s to %s based on the current stabilized pearl owner",
+                            target.x(),
+                            target.y(),
+                            target.z(),
+                            storedPearl.ownerInfo().describe(),
+                            tracked.ownerSummary()
+                    ));
+                    if (storedPearl.pearl().pearlId != null) {
+                        pearlManager.removePearl(storedPearl.ownerUuid(), storedPearl.pearl().pearlId);
+                    }
+                    existingStored = Optional.empty();
+                }
+            }
+
+            if (existingStored.isPresent()) {
+                StoredPearlEntry storedPearl = existingStored.get();
                 if (isDifferentOwner(tracked.owner(), storedPearl.ownerInfo()) && tracked.ownerHasName() && !tracked.conflictNotified()) {
                     sendForeignOwnershipWhisper(tracked.owner().name(), storedPearl.ownerInfo());
                     tracked.markConflictNotified();
@@ -292,8 +311,8 @@ public class AutoDetectModule extends Module {
                 ? "load" : PLUGIN_CONFIG.autoLoad.loadCommand;
 
         String message = determineBotName()
-                .map(botName -> String.format("Pearl Registered. Load me with /w %s %s %s", botName, loadCommand, pearlId))
-                .orElse(String.format("Pearl Registered as %s.", pearlId));
+                .map(botName -> PearlManager.prefixMessage(String.format("Pearl Registered. Load me with /w %s %s %s", botName, loadCommand, pearlId)))
+                .orElse(PearlManager.prefixMessage(String.format("Pearl Registered as %s.", pearlId)));
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(ownerName, message));
         info(String.format(
                 "Whispered registration instructions to %s for loader %s",
@@ -323,7 +342,7 @@ public class AutoDetectModule extends Module {
             return;
         }
 
-        String message = String.format("Pearl spot already belongs to %s.", storedOwner.name());
+        String message = PearlManager.prefixMessage(String.format("Pearl spot already belongs to %s.", storedOwner.name()));
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(throwerName, message));
         info(String.format("Notified %s that loader column is owned by %s", throwerName, storedOwner.describe()));
     }
@@ -599,8 +618,8 @@ public class AutoDetectModule extends Module {
         }
 
         String message = (pearlId == null || pearlId.isBlank())
-                ? "A pearl was unregistered."
-                : "Pearl " + pearlId + " was unregistered.";
+                ? PearlManager.prefixMessage("A pearl was unregistered.")
+                : PearlManager.prefixMessage("Pearl " + pearlId + " was unregistered.");
 
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(target, message));
         info(String.format("Whispered pearl removal notice to %s for %s", owner.describe(), pearlId == null ? "unknown pearl" : pearlId));

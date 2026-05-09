@@ -10,14 +10,26 @@ import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.util.InventoryUtil;
 import com.zenith.util.ChatUtil;
+import com.zenith.feature.player.Input;
+import com.zenith.feature.player.InputRequest;
+import com.zenith.feature.player.RotationHelper;
+import com.zenith.feature.player.raycast.BlockRaycastResult;
+import com.zenith.feature.player.raycast.RaycastHelper;
+import com.zenith.feature.player.raycast.RayIntersection;
+import com.zenith.mc.block.Direction;
+import com.zenith.module.impl.KillAura;
+import org.cloudburstmc.math.vector.Vector2f;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import dev.zenith.pearlplus.PearlPlusConfig;
 import com.zenith.module.api.Module;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 import java.util.function.Predicate;
 
@@ -26,13 +38,48 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class PearlManager {
+    private static final double TRAPDOOR_INTERACT_DISTANCE_SQ = 20.25D;
+    private static final int PEARLPLUS_ACTION_PRIORITY = 1500;
+    public static final String MESSAGE_PREFIX = "[SyntaxPearl] ";
+    private static final long IDLE_HOME_INTERVAL_MS = 10_000L;
+    private static final double HOME_REACHED_DISTANCE_SQ = 0.36D;
+    private static final long TRAPDOOR_SEQUENCE_DELAY_MS = 75L;
+    private static final long ACTION_TIMEOUT_MS = 15_000L;
+
     private final Module notifier;
+    private int killAuraSuppressionDepth = 0;
+    private boolean restoreKillAuraEnabled = false;
+    private boolean actionInProgress = false;
+    private long lastIdleHomeAttemptMs = 0L;
+    private long trapdoorSequenceId = 0L;
+    private long actionStartedAtMs = 0L;
+    private String actionDescription = "";
 
     public PearlManager(Module notifier) {
         this.notifier = notifier;
     }
 
     public record PlayerPearl(UUID ownerUuid, String ownerName, PearlPlusConfig.StoredPearl pearl) {
+    }
+
+    public static String prefixMessage(final String message) {
+        return MESSAGE_PREFIX + message;
+    }
+
+    public boolean isActionInProgress() {
+        return actionInProgress;
+    }
+
+    private void beginAction(final String description) {
+        actionInProgress = true;
+        actionStartedAtMs = System.currentTimeMillis();
+        actionDescription = description;
+    }
+
+    private void endAction() {
+        actionInProgress = false;
+        actionStartedAtMs = 0L;
+        actionDescription = "";
     }
 
     public Optional<PlayerPearl> findPearl(UUID ownerUuid, String pearlId) {
@@ -105,6 +152,11 @@ public class PearlManager {
     public String defaultPearlId(UUID ownerUuid) {
         PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.get(ownerUuid);
         if (entry == null) return null;
+        String closestPresentPearl = closestPresentPearlIdToHome(entry);
+        if (closestPresentPearl != null) {
+            return closestPresentPearl;
+        }
+
         String configuredDefault = entry.defaultPearlId;
         if (configuredDefault != null && entry.pearls.containsKey(configuredDefault)) {
             if (!PLUGIN_CONFIG.autoLoad.autoDefaultToPresent || isPearlPresent(entry.pearls.get(configuredDefault))) {
@@ -125,6 +177,45 @@ public class PearlManager {
         }
 
         return entry.pearls.keySet().stream().findFirst().orElse(null);
+    }
+
+    private String closestPresentPearlIdToHome(final PearlPlusConfig.PlayerPearls entry) {
+        if (entry == null || entry.pearls == null || entry.pearls.isEmpty()) {
+            return null;
+        }
+
+        double anchorX;
+        double anchorY;
+        double anchorZ;
+        if (hasConfiguredHome()) {
+            anchorX = PLUGIN_CONFIG.autoLoad.home.x;
+            anchorY = PLUGIN_CONFIG.autoLoad.home.y;
+            anchorZ = PLUGIN_CONFIG.autoLoad.home.z;
+        } else if (CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null) {
+            anchorX = CACHE.getPlayerCache().getThePlayer().getX();
+            anchorY = CACHE.getPlayerCache().getThePlayer().getY();
+            anchorZ = CACHE.getPlayerCache().getThePlayer().getZ();
+        } else {
+            return null;
+        }
+
+        String bestId = null;
+        double bestDistSq = Double.MAX_VALUE;
+        for (var pearlEntry : entry.pearls.entrySet()) {
+            PearlPlusConfig.StoredPearl pearl = pearlEntry.getValue();
+            if (!isPearlPresent(pearl)) {
+                continue;
+            }
+            double dx = pearl.x - anchorX;
+            double dy = pearl.y - anchorY;
+            double dz = pearl.z - anchorZ;
+            double distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
+                bestId = pearlEntry.getKey();
+            }
+        }
+        return bestId;
     }
 
     public void setDefaultPearl(UUID ownerUuid, String pearlId) {
@@ -230,86 +321,445 @@ public class PearlManager {
         return bestPos;
     }
 
+    private boolean isTrapdoorAt(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getChunkCache() == null) {
+            return false;
+        }
+
+        var section = CACHE.getChunkCache().getChunkSection(x, y, z);
+        if (section == null) {
+            return false;
+        }
+
+        int stateId = section.getBlock(x & 15, y & 15, z & 15);
+        if (stateId == 0) {
+            return false;
+        }
+
+        var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+        return block != null && block.name().endsWith("_trapdoor");
+    }
+
+    private boolean isTrapdoorOpenAt(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getChunkCache() == null) {
+            return false;
+        }
+
+        var section = CACHE.getChunkCache().getChunkSection(x, y, z);
+        if (section == null) {
+            return false;
+        }
+
+        int stateId = section.getBlock(x & 15, y & 15, z & 15);
+        if (stateId == 0) {
+            return false;
+        }
+
+        var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+        if (block == null || !block.name().endsWith("_trapdoor")) {
+            return false;
+        }
+
+        try {
+            var boxes = BLOCK_DATA.localizeCollisionBoxes(
+                    BLOCK_DATA.getCollisionBoxesFromBlockStateId(stateId),
+                    block,
+                    x,
+                    y,
+                    z
+            );
+            if (boxes == null || boxes.isEmpty()) {
+                return false;
+            }
+
+            // Closed trapdoors are thin horizontal slabs; open trapdoors are thin vertical planes.
+            boolean mostlyHorizontal = boxes.stream().anyMatch(box -> {
+                double thicknessY = box.maxY() - box.minY();
+                double spanX = box.maxX() - box.minX();
+                double spanZ = box.maxZ() - box.minZ();
+                return thicknessY <= 0.30D && spanX >= 0.90D && spanZ >= 0.90D;
+            });
+            return !mostlyHorizontal;
+        } catch (Exception e) {
+            LOG.warn("Failed inferring trapdoor state at [{}, {}, {}]", x, y, z, e);
+            return false;
+        }
+    }
+
+    private boolean isAirLike(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getChunkCache() == null) {
+            return false;
+        }
+
+        var section = CACHE.getChunkCache().getChunkSection(x, y, z);
+        if (section == null) {
+            return false;
+        }
+
+        int stateId = section.getBlock(x & 15, y & 15, z & 15);
+        if (stateId == 0) {
+            return true;
+        }
+
+        var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+        if (block == null) {
+            return false;
+        }
+
+        String name = block.name();
+        return name.contains("air")
+                || name.contains("cave_air")
+                || name.contains("void_air");
+    }
+
+    private boolean isStandableGround(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getChunkCache() == null) {
+            return false;
+        }
+
+        var section = CACHE.getChunkCache().getChunkSection(x, y, z);
+        if (section == null) {
+            return false;
+        }
+
+        int stateId = section.getBlock(x & 15, y & 15, z & 15);
+        if (stateId == 0) {
+            return false;
+        }
+
+        var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+        if (block == null) {
+            return false;
+        }
+
+        String name = block.name();
+        return !name.contains("water")
+                && !name.contains("lava")
+                && !name.endsWith("_trapdoor")
+                && !name.contains("ladder")
+                && !name.contains("vine")
+                && !name.contains("scaffolding");
+    }
+
+    private double distanceSqToBlockCenter(final int ax, final int ay, final int az,
+                                           final int bx, final int by, final int bz) {
+        double dx = (ax + 0.5D) - (bx + 0.5D);
+        double dy = (ay + 0.5D) - (by + 0.5D);
+        double dz = (az + 0.5D) - (bz + 0.5D);
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private double distanceSqToPoint(final int blockX, final int blockY, final int blockZ,
+                                     final double pointX, final double pointY, final double pointZ) {
+        double dx = (blockX + 0.5D) - pointX;
+        double dy = (blockY + 0.5D) - pointY;
+        double dz = (blockZ + 0.5D) - pointZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private void finishPearlLoad(final PearlPlusConfig.StoredPearl pearl, final String requesterName, final BlockPos startPos) {
+        var builder = Embed.builder()
+                .title("Pearl Loaded!")
+                .addField("Pearl ID", pearl.pearlId, false)
+                .successColor();
+        if (requesterName != null) {
+            builder.addField("Requested By", requesterName, false);
+        }
+        notifier.discordAndIngameNotification(builder);
+
+        if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
+            handlePearlDropAfterLoad(requesterName);
+        }
+
+        returnAfterLoad(startPos);
+    }
+
+    private void returnAfterLoad(final BlockPos startPos) {
+        if (PLUGIN_CONFIG.autoLoad.returnHomeEnabled && hasConfiguredHome()) {
+            pathToConfiguredHome(false);
+            return;
+        }
+
+        if (PLUGIN_CONFIG.autoLoad.returnToStartPos && startPos != null) {
+            BARITONE.pathTo(startPos.x(), startPos.y(), startPos.z())
+                    .addExecutedListener(f2 -> {
+                        notifier.discordAndIngameNotification(
+                                Embed.builder()
+                                        .description("Returned to start pos")
+                                        .successColor()
+                        );
+                        endAction();
+                        releaseKillAuraSuppression();
+                    });
+            return;
+        }
+
+        endAction();
+        releaseKillAuraSuppression();
+    }
+
+    private boolean hasConfiguredHome() {
+        return PLUGIN_CONFIG.autoLoad.home.x != null
+                && PLUGIN_CONFIG.autoLoad.home.y != null
+                && PLUGIN_CONFIG.autoLoad.home.z != null;
+    }
+
+    private void pathToConfiguredHome(final boolean idleRecovery) {
+        double homeX = PLUGIN_CONFIG.autoLoad.home.x;
+        double homeY = PLUGIN_CONFIG.autoLoad.home.y;
+        double homeZ = PLUGIN_CONFIG.autoLoad.home.z;
+
+        int blockX = (int) Math.floor(homeX);
+        int blockY = (int) Math.floor(homeY);
+        int blockZ = (int) Math.floor(homeZ);
+
+        info(String.format("Returning to configured home at [%.3f, %.3f, %.3f]", homeX, homeY, homeZ));
+        BARITONE.pathTo(blockX, blockY, blockZ)
+                .addExecutedListener(future -> {
+                    if (idleRecovery) {
+                        info(String.format("Idle recovery returned home to [%.3f, %.3f, %.3f]", homeX, homeY, homeZ));
+                    } else {
+                        notifyReturnedHome(homeX, homeY, homeZ);
+                    }
+                    endAction();
+                    releaseKillAuraSuppression();
+                });
+    }
+
+    private void notifyReturnedHome(final double homeX, final double homeY, final double homeZ) {
+        notifier.discordAndIngameNotification(
+                Embed.builder()
+                        .description(String.format("Returned home to %.3f %.3f %.3f", homeX, homeY, homeZ))
+                        .successColor()
+        );
+    }
+
+    private boolean isWithinTrapdoorInteractRange(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getPlayerCache() == null || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+
+        var player = CACHE.getPlayerCache().getThePlayer();
+        double dx = (x + 0.5D) - player.getX();
+        double dy = (y + 0.5D) - player.getY();
+        double dz = (z + 0.5D) - player.getZ();
+        double distanceSq = dx * dx + dy * dy + dz * dz;
+        return distanceSq <= TRAPDOOR_INTERACT_DISTANCE_SQ;
+    }
+
+    private boolean isAtConfiguredHome() {
+        if (!hasConfiguredHome() || CACHE == null || CACHE.getPlayerCache() == null || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+
+        double dx = CACHE.getPlayerCache().getThePlayer().getX() - PLUGIN_CONFIG.autoLoad.home.x;
+        double dy = CACHE.getPlayerCache().getThePlayer().getY() - PLUGIN_CONFIG.autoLoad.home.y;
+        double dz = CACHE.getPlayerCache().getThePlayer().getZ() - PLUGIN_CONFIG.autoLoad.home.z;
+        return (dx * dx) + (dy * dy) + (dz * dz) <= HOME_REACHED_DISTANCE_SQ;
+    }
+
+    private void clickTrapdoorAndFinish(final PearlPlusConfig.StoredPearl pearl,
+                                        final String requesterName,
+                                        final BlockPos startPos,
+                                        final int targetX,
+                                        final int targetY,
+                                        final int targetZ,
+                                        final boolean hasUpperTrapdoor,
+                                        final int lidY) {
+        final long sequenceId = ++trapdoorSequenceId;
+        BARITONE.rightClickBlock(targetX, targetY, targetZ)
+                .addExecutedListener(f -> {
+                    if (sequenceId != trapdoorSequenceId) {
+                        return;
+                    }
+                    final boolean upperTrapdoorOpenNow = hasUpperTrapdoor && isTrapdoorOpenAt(targetX, lidY, targetZ);
+                    if (hasUpperTrapdoor) {
+                        info("Post-load upper trapdoor state at ["
+                                + targetX + ", " + lidY + ", " + targetZ + "] open=" + upperTrapdoorOpenNow);
+                    }
+                    if (hasUpperTrapdoor && !upperTrapdoorOpenNow) {
+                        EXECUTOR.schedule(() -> {
+                            if (sequenceId != trapdoorSequenceId) {
+                                return;
+                            }
+                            openTrapdoorDirect(targetX, lidY, targetZ, () ->
+                                    EXECUTOR.schedule(() -> {
+                                        if (sequenceId != trapdoorSequenceId) {
+                                            return;
+                                        }
+                                        BARITONE.rightClickBlock(targetX, targetY, targetZ)
+                                                .addExecutedListener(f2 -> {
+                                                    if (sequenceId != trapdoorSequenceId) {
+                                                        return;
+                                                    }
+                                                    finishPearlLoad(pearl, requesterName, startPos);
+                                                });
+                                    }, TRAPDOOR_SEQUENCE_DELAY_MS, TimeUnit.MILLISECONDS));
+                        }, TRAPDOOR_SEQUENCE_DELAY_MS, TimeUnit.MILLISECONDS);
+                        return;
+                    }
+                    EXECUTOR.schedule(() -> {
+                        if (sequenceId != trapdoorSequenceId) {
+                            return;
+                        }
+                        BARITONE.rightClickBlock(targetX, targetY, targetZ)
+                                .addExecutedListener(f2 -> {
+                                    if (sequenceId != trapdoorSequenceId) {
+                                        return;
+                                    }
+                                    finishPearlLoad(pearl, requesterName, startPos);
+                                });
+                    }, TRAPDOOR_SEQUENCE_DELAY_MS, TimeUnit.MILLISECONDS);
+                });
+    }
+
+    private void acquireKillAuraSuppression() {
+        if (killAuraSuppressionDepth++ > 0) {
+            return;
+        }
+
+        boolean enabled = CONFIG.client.extra.killAura.enabled;
+        restoreKillAuraEnabled = enabled;
+        if (enabled) {
+            CONFIG.client.extra.killAura.enabled = false;
+            MODULE.get(KillAura.class).syncEnabledFromConfig();
+            info("Temporarily disabled KillAura for SyntaxPearl action");
+        }
+    }
+
+    private void releaseKillAuraSuppression() {
+        if (killAuraSuppressionDepth == 0) {
+            return;
+        }
+
+        killAuraSuppressionDepth--;
+        if (killAuraSuppressionDepth > 0) {
+            return;
+        }
+
+        if (restoreKillAuraEnabled) {
+            CONFIG.client.extra.killAura.enabled = true;
+            MODULE.get(KillAura.class).syncEnabledFromConfig();
+            info("Restored KillAura after SyntaxPearl action");
+        }
+        restoreKillAuraEnabled = false;
+    }
+
+    private void openTrapdoorDirect(final int x, final int y, final int z, final Runnable afterAttempt) {
+        try {
+            Vector2f rotationVec = RotationHelper.rotationTo(x + 0.5D, y + 0.5D, z + 0.5D);
+            float yaw = rotationVec.getX();
+            float pitch = rotationVec.getY();
+
+            var section = CACHE != null && CACHE.getChunkCache() != null
+                    ? CACHE.getChunkCache().getChunkSection(x, y, z)
+                    : null;
+            if (section == null) {
+                info("Direct trapdoor interaction skipped: missing chunk section at [" + x + ", " + y + ", " + z + "]");
+                if (afterAttempt != null) {
+                    afterAttempt.run();
+                }
+                return;
+            }
+
+            int stateId = section.getBlock(x & 15, y & 15, z & 15);
+            var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+            if (block == null) {
+                info("Direct trapdoor interaction skipped: missing block data at [" + x + ", " + y + ", " + z + "]");
+                if (afterAttempt != null) {
+                    afterAttempt.run();
+                }
+                return;
+            }
+
+            var hit = new BlockRaycastResult(
+                    true,
+                    x,
+                    y,
+                    z,
+                    new RayIntersection(x + 0.5D, y + 0.5D, z + 0.5D, Direction.UP),
+                    block
+            );
+
+            var rotateOnly = InputRequest.builder()
+                    .owner(this)
+                    .input(Input.builder().build())
+                    .yaw(yaw)
+                    .pitch(pitch)
+                    .priority(PEARLPLUS_ACTION_PRIORITY)
+                    .build();
+
+            INPUTS.submit(rotateOnly).addInputExecutedListener(future -> {
+                try {
+                    Method useItemOn = BOT.getInteractions().getClass()
+                            .getDeclaredMethod("useItemOn", Hand.class, BlockRaycastResult.class);
+                    useItemOn.setAccessible(true);
+                    useItemOn.invoke(BOT.getInteractions(), Hand.MAIN_HAND, hit);
+                    info("Interacted with trapdoor directly at [" + x + ", " + y + ", " + z + "]");
+                    if (afterAttempt != null) {
+                        afterAttempt.run();
+                    }
+                } catch (Exception e) {
+                    LOG.warn("Failed direct upper trapdoor interaction at [{}, {}, {}]", x, y, z, e);
+                    if (afterAttempt != null) {
+                        afterAttempt.run();
+                    }
+                }
+            });
+        } catch (Exception e) {
+            LOG.warn("Failed to prepare direct upper trapdoor interaction at [{}, {}, {}]", x, y, z, e);
+            if (afterAttempt != null) {
+                afterAttempt.run();
+            }
+        }
+    }
+
     private BlockPos findAdjacentWalkableBlock(final BlockPos trapdoorPos) {
         if (trapdoorPos == null || CACHE == null || CACHE.getChunkCache() == null) {
             info("Walkable search aborted: missing trapdoorPos or chunk cache");
             return null;
         }
 
-        var chunkCache = CACHE.getChunkCache();
-
         final int tx = (int) trapdoorPos.x();
         final int ty = (int) trapdoorPos.y();
         final int tz = (int) trapdoorPos.z();
+        final double anchorX = hasConfiguredHome() ? PLUGIN_CONFIG.autoLoad.home.x : tx + 0.5D;
+        final double anchorY = hasConfiguredHome() ? PLUGIN_CONFIG.autoLoad.home.y : ty + 0.5D;
+        final double anchorZ = hasConfiguredHome() ? PLUGIN_CONFIG.autoLoad.home.z : tz + 0.5D;
 
-        // check 4 cardinal neighbours around the trapdoor
-        int[][] offsets = {
-                { 1, 0 },
-                { -1, 0 },
-                { 0, 1 },
-                { 0, -1 }
-        };
+        BlockPos bestPos = null;
+        double bestDistSq = Double.MAX_VALUE;
 
-        for (int[] off : offsets) {
-            int x = tx + off[0];
-            int z = tz + off[1];
-            int groundY = ty - 1; // assume floor is one below trapdoor
-
-            // ground block
-            var groundSection = chunkCache.getChunkSection(x, groundY, z);
-            if (groundSection == null) {
-                continue;
-            }
-
-            int relX = x & 15;
-            int relY = groundY & 15;
-            int relZ = z & 15;
-
-            int groundStateId = groundSection.getBlock(relX, relY, relZ);
-            if (groundStateId == 0) {
-                // air / unknown not walkable
-                continue;
-            }
-
-            var groundBlock = BLOCK_DATA.getBlockDataFromBlockStateId(groundStateId);
-            if (groundBlock == null) {
-                continue;
-            }
-
-            String groundName = groundBlock.name();
-
-            if (groundName.contains("water")
-                    || groundName.contains("lava")
-                    || groundName.endsWith("_trapdoor")
-                    || groundName.contains("ladder")
-                    || groundName.contains("vine")
-                    || groundName.contains("scaffolding")) {
-                continue;
-            }
-
-            // check the space where the player will stand
-            int headY = groundY + 1;
-            var headSection = chunkCache.getChunkSection(x, headY, z);
-            if (headSection == null) {
-                continue;
-            }
-
-            int headStateId = headSection.getBlock(x & 15, headY & 15, z & 15);
-            if (headStateId != 0) {
-                var headBlock = BLOCK_DATA.getBlockDataFromBlockStateId(headStateId);
-                if (headBlock != null) {
-                    String headName = headBlock.name();
-                    if (!headName.contains("air")) {
+        for (int x = tx - 3; x <= tx + 3; x++) {
+            for (int z = tz - 3; z <= tz + 3; z++) {
+                for (int feetY = ty - 2; feetY <= ty + 2; feetY++) {
+                    int groundY = feetY - 1;
+                    if (!isStandableGround(x, groundY, z)) {
                         continue;
+                    }
+                    if (!isAirLike(x, feetY, z) || !isAirLike(x, feetY + 1, z)) {
+                        continue;
+                    }
+
+                    double interactDistSq = distanceSqToBlockCenter(x, feetY, z, tx, ty, tz);
+                    if (interactDistSq > TRAPDOOR_INTERACT_DISTANCE_SQ) {
+                        continue;
+                    }
+
+                    double candidateDistSq = distanceSqToPoint(x, feetY, z, anchorX, anchorY, anchorZ);
+                    if (candidateDistSq < bestDistSq) {
+                        bestDistSq = candidateDistSq;
+                        bestPos = new BlockPos(x, feetY, z);
                     }
                 }
             }
+        }
 
-            BlockPos walkPos = new BlockPos(x, groundY, z);
-            info("Found adjacent walkable block near trapdoor at ["
+        if (bestPos != null) {
+            info("Found walkable interact block near trapdoor at ["
                     + tx + ", " + ty + ", " + tz + "] -> ["
-                    + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z() + "]");
-            return walkPos;
+                    + bestPos.x() + ", " + bestPos.y() + ", " + bestPos.z() + "]");
+            return bestPos;
         }
 
         info("No adjacent walkable block found around trapdoor at ["
@@ -319,6 +769,10 @@ public class PearlManager {
 
     public void loadPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
         if (pearl == null) {
+            return;
+        }
+        if (actionInProgress) {
+            info("Ignoring pearl load request while another SyntaxPearl action is already running");
             return;
         }
         Proxy proxy = Proxy.getInstance();
@@ -336,6 +790,9 @@ public class PearlManager {
                     .errorColor());
             return;
         }
+
+        acquireKillAuraSuppression();
+        beginAction("load pearl " + pearl.pearlId);
 
         // make sure there is a pearl to drop for the player before walking.
         if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
@@ -358,29 +815,7 @@ public class PearlManager {
             final BlockPos startPos = current;
 
             BARITONE.rightClickBlock(targetX, targetY, targetZ)
-                    .addExecutedListener(f -> {
-                        var builder = Embed.builder()
-                                .title("Pearl Loaded!")
-                                .addField("Pearl ID", pearl.pearlId, false)
-                                .successColor();
-                        if (requesterName != null) {
-                            builder.addField("Requested By", requesterName, false);
-                        }
-                        notifier.discordAndIngameNotification(builder);
-
-                        if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
-                            handlePearlDropAfterLoad(requesterName);
-                        }
-
-                        if (PLUGIN_CONFIG.autoLoad.returnToStartPos) {
-                            BARITONE.pathTo(startPos.x(), startPos.y(), startPos.z())
-                                    .addExecutedListener(f2 -> notifier.discordAndIngameNotification(
-                                            Embed.builder()
-                                                    .description("Returned to start pos")
-                                                    .successColor()
-                                    ));
-                        }
-                    });
+                    .addExecutedListener(f -> finishPearlLoad(pearl, requesterName, startPos));
 
             notifier.discordAndIngameNotification(Embed.builder()
                     .title("Loading Pearl")
@@ -413,46 +848,68 @@ public class PearlManager {
         final int targetX = trapX;
         final int targetY = trapY;
         final int targetZ = trapZ;
+        final int lidY = trapY + 1;
+        final boolean hasUpperTrapdoor = isTrapdoorAt(trapX, lidY, trapZ);
         final int pathTargetX = pathX;
+        final int pathTargetY = walkPos != null ? (int) walkPos.y() : Math.max(trapY - 1, 0);
         final int pathTargetZ = pathZ;
         final BlockPos startPos = current;
 
+        if (hasUpperTrapdoor) {
+            info("Detected upper trapdoor lid at ["
+                    + trapX + ", " + lidY + ", " + trapZ + "]");
+        }
+
+        if (isWithinTrapdoorInteractRange(targetX, targetY, targetZ)) {
+            info("Already within trapdoor interact range, skipping pathing and clicking loader directly");
+            clickTrapdoorAndFinish(pearl, requesterName, startPos, targetX, targetY, targetZ, hasUpperTrapdoor, lidY);
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Loading Pearl")
+                    .addField("Pearl", pearl.pearlId, false)
+                    .primaryColor());
+            return;
+        }
+
         // path to the walkable block and right-click the trapdoor
-        BARITONE.pathTo(pathTargetX, pathTargetZ)
+        BARITONE.pathTo(pathTargetX, pathTargetY, pathTargetZ)
                 .addExecutedListener(pathFuture -> {
                     // once pathing attempt is "done", try the click regardless of success/failure.
-                    BARITONE.rightClickBlock(targetX, targetY, targetZ)
-                            .addExecutedListener(f -> {
-                                var builder = Embed.builder()
-                                        .title("Pearl Loaded!")
-                                        .addField("Pearl ID", pearl.pearlId, false)
-                                        .successColor();
-                                if (requesterName != null) {
-                                    builder.addField("Requested By", requesterName, false);
-                                }
-                                notifier.discordAndIngameNotification(builder);
-
-                                // drop a pearl when loaded.
-                                if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
-                                    handlePearlDropAfterLoad(requesterName);
-                                }
-
-                                // return to start position.
-                                if (PLUGIN_CONFIG.autoLoad.returnToStartPos) {
-                                    BARITONE.pathTo(startPos.x(), startPos.y(), startPos.z())
-                                            .addExecutedListener(f2 -> notifier.discordAndIngameNotification(
-                                                    Embed.builder()
-                                                            .description("Returned to start pos")
-                                                            .successColor()
-                                            ));
-                                }
-                            });
+                    clickTrapdoorAndFinish(pearl, requesterName, startPos, targetX, targetY, targetZ, hasUpperTrapdoor, lidY);
                 });
 
         notifier.discordAndIngameNotification(Embed.builder()
                 .title("Loading Pearl")
                 .addField("Pearl", pearl.pearlId, false)
                 .primaryColor());
+    }
+
+    public void tickIdleHomeCheck(final long now) {
+        if (actionInProgress && now - actionStartedAtMs >= ACTION_TIMEOUT_MS) {
+            info("SyntaxPearl action timed out: " + actionDescription + ". Stopping Baritone and clearing action state");
+            BARITONE.stop();
+            endAction();
+            releaseKillAuraSuppression();
+        }
+        if (!PLUGIN_CONFIG.autoLoad.returnHomeEnabled || !hasConfiguredHome()) {
+            return;
+        }
+        if (actionInProgress || now - lastIdleHomeAttemptMs < IDLE_HOME_INTERVAL_MS) {
+            return;
+        }
+
+        Proxy proxy = Proxy.getInstance();
+        if (proxy == null || !proxy.isConnected() || proxy.isInQueue() || proxy.hasActivePlayer()) {
+            return;
+        }
+        if (isAtConfiguredHome()) {
+            return;
+        }
+
+        lastIdleHomeAttemptMs = now;
+        acquireKillAuraSuppression();
+        beginAction("idle return home");
+        info("Idle recovery detected bot away from home, pathing back");
+        pathToConfiguredHome(true);
     }
 
     public String pearlsList(UUID ownerUuid) {
@@ -522,22 +979,17 @@ public class PearlManager {
 
     public String nextAvailablePearlId(UUID ownerUuid, String ownerName) {
         PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.get(ownerUuid);
-        String configuredBase = PLUGIN_CONFIG.defaultPearlId;
         String base;
-        if (configuredBase != null && !configuredBase.isBlank()) {
-            base = configuredBase;
+        if (ownerName == null || ownerName.isBlank()) {
+            base = "pearl";
         } else {
-            base = (ownerName == null || ownerName.isBlank()) ? "pearl" : ownerName;
-        }
-        base = base.replaceAll("\\s+", "");
-        if (entry == null || !entry.pearls.containsKey(base)) {
-            return base;
+            base = ownerName.replaceAll("\\s+", "");
         }
 
-        int suffix = 2;
+        int suffix = 1;
         while (suffix < 10_000) {
             String candidate = base + suffix;
-            if (!entry.pearls.containsKey(candidate)) {
+            if (entry == null || !entry.pearls.containsKey(candidate)) {
                 return candidate;
             }
             suffix++;
@@ -614,7 +1066,7 @@ public class PearlManager {
             return;
         }
         
-        String message = "I'm all out of pearls, can you give me some?";
+        String message = prefixMessage("I'm all out of pearls, can you give me some?");
         notifier.sendClientPacketAsync(ChatUtil.getWhisperChatPacket(playerName, message));
         info("Sent out-of-pearls message to " + playerName);
     }

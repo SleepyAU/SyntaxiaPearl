@@ -8,7 +8,7 @@ public class PearlPlusConfig {
     public final AutoLoadConfig autoLoad = new AutoLoadConfig();
     public final AutoDetectConfig autoDetect = new AutoDetectConfig();
 
-    public String defaultPearlId = "Base";
+    public String defaultPearlId = null;
 
     public final Map<UUID, PlayerPearls> players = new LinkedHashMap<>();
     public final Map<UUID, WhitelistedPlayer> whitelist = new LinkedHashMap<>();
@@ -17,10 +17,12 @@ public class PearlPlusConfig {
         public boolean enabled = true;
         public boolean allowNoiseAfterPearl = true;
         public boolean returnToStartPos = true;
+        public boolean returnHomeEnabled = false;
         public boolean autoDefaultToPresent = true;
         public boolean whitelistEnabled = false;
         public boolean dropPearlAfterLoad = true;
         public String loadCommand = "load";
+        public final HomePosition home = new HomePosition();
     }
 
     public static final class AutoDetectConfig {
@@ -41,6 +43,12 @@ public class PearlPlusConfig {
         public int x;
         public int y;
         public int z;
+    }
+
+    public static final class HomePosition {
+        public Double x;
+        public Double y;
+        public Double z;
     }
 
     public static final class WhitelistedPlayer {

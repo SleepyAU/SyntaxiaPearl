@@ -1,6 +1,7 @@
 package dev.zenith.pearlplus.module;
 
 import com.github.rfresh2.EventConsumer;
+import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.chat.WhisperChatEvent;
 import com.zenith.module.api.Module;
 import com.zenith.util.ChatUtil;
@@ -22,6 +23,7 @@ public class AutoLoadModule extends Module {
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
+            of(ClientBotTick.class, event -> pearlManager.tickIdleHomeCheck(System.currentTimeMillis())),
             of(WhisperChatEvent.class, this::onWhisper)
         );
     }
@@ -51,7 +53,7 @@ public class AutoLoadModule extends Module {
         if (msg.equals("pearls")) {
             var playerEntry = PLUGIN_CONFIG.players.get(uuid);
             if (playerEntry != null && !playerEntry.pearls.isEmpty()) {
-                String list = pearlManager.pearlsList(uuid);
+                String list = PearlManager.prefixMessage(pearlManager.pearlsList(uuid));
                 sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, list));
             }
             return;
@@ -64,16 +66,16 @@ public class AutoLoadModule extends Module {
                 return;
             }
             if (parts.length < 2) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Specify a pearl ID to set as default."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Specify a pearl ID to set as default.")));
                 return;
             }
             String resolved = pearlManager.resolvePearlId(uuid, parts[1]);
             if (resolved == null) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Pearl not found."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Pearl not found.")));
                 return;
             }
             pearlManager.setDefaultPearl(uuid, resolved);
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Default pearl set to " + resolved + "."));
+            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Default pearl set to " + resolved + ".")));
             return;
         }
 
@@ -84,26 +86,26 @@ public class AutoLoadModule extends Module {
                 return;
             }
             if (parts.length < 3) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Usage: rename <oldId> <newId>"));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Usage: rename <oldId> <newId>")));
                 return;
             }
             String oldPearlId = pearlManager.resolvePearlId(uuid, parts[1]);
             if (oldPearlId == null) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Pearl not found."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Pearl not found.")));
                 return;
             }
             String newPearlId = parts[2];
             boolean exists = playerEntry.pearls.keySet().stream()
                     .anyMatch(id -> id.equalsIgnoreCase(newPearlId));
             if (exists) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "A pearl with that id already exists."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("A pearl with that id already exists.")));
                 return;
             }
             boolean renamed = pearlManager.renamePearl(uuid, oldPearlId, newPearlId);
             if (renamed) {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Renamed " + oldPearlId + " to " + newPearlId + "."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Renamed " + oldPearlId + " to " + newPearlId + ".")));
             } else {
-                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Unable to rename pearl."));
+                sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Unable to rename pearl.")));
             }
             return;
         }
@@ -144,7 +146,7 @@ public class AutoLoadModule extends Module {
 
         if (requestedPearl == null || !playerEntry.pearls.containsKey(requestedPearl)) {
             info("Unauthorized load from " + name + " with arg: " + rawMessage);
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "No authorized pearls found."));
+            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("No authorized pearls found.")));
             return;
         }
 
@@ -167,10 +169,11 @@ public class AutoLoadModule extends Module {
         }
 
         if (!pearlManager.isPearlPresent(pearl)) {
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "No pearl detected. Attempting to load anyways."));
-        }else{
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Loading pearl " + requestedPearl + "... "+pearlFeedback));
+            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("No pearl detected for " + requestedPearl + ".")));
+            return;
         }
+
+        sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Loading pearl " + requestedPearl + "... " + pearlFeedback)));
 
         pearlManager.loadPearl(pearl, name);
         

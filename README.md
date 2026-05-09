@@ -1,9 +1,10 @@
-## PearlPlus
+## SyntaxPearl
 
-PearlPlus automatically detects new stasis pearls and registers them with its own pearl loader. Pearl throwers can then load these pearls through chat whispers.
-The config is saved to `plugins/config/pearlplus.json`
+SyntaxPearl is a Syntaxia Development fork of PearlPlus. It automatically detects new stasis pearls and registers them with its own pearl loader. Pearl throwers can then load these pearls through chat whispers.
+Credits to the original PearlPlus developers: duccss, steve2b2t, and Leonetic.
+The config is saved to `plugins/config/syntaxpearl.json`
 
-In Zenith run `plugins download https://github.com/duccss/PearlPlus/releases/download/2.1.0/PearlPlus-2.1.0.jar` or download the [lastest build](https://github.com/duccss/PearlPlus/releases/latest) and place the jar file in your proxy's plugin folder.
+Place `SyntaxPearl-2.1.0.jar` in your proxy's plugin folder, or build it from this fork and use the generated jar from `build/libs/`.
 
 This plugin **WILL NOT WORK** unless a correct `chatschema` is set in Zenith. Most vanilla servers like 2b2t and Constantiam don't require you to set one but other servers with custom whisper builders for example 9b9t will need one. Please check the wiki [here](https://wiki.2b2t.vc/Commands/#chatschema).
 You might also need to set the whisper command for the server you're playing on using `extraChat whisperCommand <command>` to allow the bot to whisper back.
@@ -78,7 +79,7 @@ There are a few in-game commands players can whisper to the bot to manage their 
 
 ### Usage
 
-Simply throw a new ender pearl and once it becomes stable the bot will register it, setting the pearlID as "Base" by default with an incrementing number for subsequent pearls. That player can now whisper `load` (or your configured load command) to the zenith bot and the bot will load the pearl. Players with multiple pearls can add the pearlID after the trigger word to have a specific pearl loaded. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
+Simply throw a new ender pearl and once it becomes stable the bot will register it, using the player name with a numeric suffix such as `SleepyFemboy1`, `SleepyFemboy2`, and so on. That player can then whisper `load` (or your configured load command) to the Zenith bot and the bot will load the closest present pearl to the configured home position. Players with multiple pearls can still add a specific pearl ID after the trigger word to force a specific chamber. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
 ```bash
 /w <botName> load <optionalID> 
 ```

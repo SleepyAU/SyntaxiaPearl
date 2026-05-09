@@ -10,6 +10,7 @@ import com.zenith.feature.whitelist.PlayerListsManager;
 import dev.zenith.pearlplus.module.AutoLoadModule;
 import dev.zenith.pearlplus.module.AutoDetectModule;
 import dev.zenith.pearlplus.module.PearlManager;
+import org.cloudburstmc.math.vector.Vector3d;
 
 import java.util.UUID;
 
@@ -20,6 +21,8 @@ import static com.zenith.command.brigadier.CustomStringArgumentType.getString;
 import static com.zenith.command.brigadier.CustomStringArgumentType.wordWithChars;
 import static com.zenith.command.brigadier.ToggleArgumentType.getToggle;
 import static com.zenith.command.brigadier.ToggleArgumentType.toggle;
+import static com.zenith.command.brigadier.Vec3Argument.getVec3;
+import static com.zenith.command.brigadier.Vec3Argument.vec3;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
 
@@ -27,7 +30,7 @@ public class PearlPlusCommand extends Command {
     @Override
     public CommandUsage commandUsage() {
         return CommandUsage.builder()
-            .name("pearlplus")
+            .name("syntaxpearl")
             .category(CommandCategory.MODULE)
             .description("Allow players to load pearls without whitelist through whispers.")
             .usageLines(
@@ -39,6 +42,8 @@ public class PearlPlusCommand extends Command {
                 "defaultpearlid <word|none>",
                 "load <playerName> <pearlId>",
                 "returnpos <on/off>",
+                "home <on/off>",
+                "home coords <x> <y> <z>",
                 "strict <on/off>",
                 "loadcommand <word>",
                 "autodetect <on/off>",
@@ -48,13 +53,13 @@ public class PearlPlusCommand extends Command {
                 "whitelist <on/off / add / clear / list / remove>",
                 "droppearlafterload <on/off>"
             )
-            .aliases("pp")
+            .aliases("pp", "pearlplus")
             .build();
     }
 
     @Override
     public LiteralArgumentBuilder<CommandContext> register() {
-        LiteralArgumentBuilder<CommandContext> builder = command("pearlplus")
+        LiteralArgumentBuilder<CommandContext> builder = command("syntaxpearl")
                 .requires(Command::validateAccountOwner);
 
         builder.then(argument("toggle", toggle()).executes(c -> {
@@ -62,7 +67,7 @@ public class PearlPlusCommand extends Command {
             PLUGIN_CONFIG.autoLoad.enabled = enabled;
             MODULE.get(AutoLoadModule.class).syncEnabledFromConfig();
             c.getSource().getEmbed()
-                    .title("PearlPlus " + toggleStrCaps(enabled));
+                    .title("SyntaxPearl " + toggleStrCaps(enabled));
             return 0;
         }));
 
@@ -207,7 +212,7 @@ public class PearlPlusCommand extends Command {
                     boolean strict = getToggle(c, "toggle");
                     PLUGIN_CONFIG.autoLoad.allowNoiseAfterPearl = !strict;
                     c.getSource().getEmbed()
-                            .title("PearlPlus strict " + toggleStrCaps(strict));
+                            .title("SyntaxPearl strict " + toggleStrCaps(strict));
                     return 0;
                 })));
 
@@ -215,10 +220,53 @@ public class PearlPlusCommand extends Command {
                 .then(argument("toggle", toggle()).executes(c -> {
                     boolean enabled = getToggle(c, "toggle");
                     PLUGIN_CONFIG.autoLoad.returnToStartPos = enabled;
+                    if (enabled) {
+                        PLUGIN_CONFIG.autoLoad.returnHomeEnabled = false;
+                    }
                     c.getSource().getEmbed()
-                            .title("PearlPlus Return to Start " + toggleStrCaps(enabled));
+                            .title("SyntaxPearl Return to Start " + toggleStrCaps(enabled))
+                            .description(enabled
+                                    ? "Return home disabled so only one post-load return mode is active."
+                                    : null);
                     return 0;
                 })));
+
+        builder.then(literal("home")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    boolean enabled = getToggle(c, "toggle");
+                    if (enabled && !hasConfiguredHome()) {
+                        c.getSource().getEmbed().title("Set home coords first with `pp home coords <x> <y> <z>`");
+                        return 0;
+                    }
+                    PLUGIN_CONFIG.autoLoad.returnHomeEnabled = enabled;
+                    if (enabled) {
+                        PLUGIN_CONFIG.autoLoad.returnToStartPos = false;
+                    }
+                    c.getSource().getEmbed()
+                            .title("SyntaxPearl Return Home " + toggleStrCaps(enabled))
+                            .description(enabled
+                                    ? "Return to start disabled so only one post-load return mode is active."
+                                    : null);
+                    return 0;
+                }))
+                .then(literal("coords")
+                        .then(argument("pos", vec3(false)).executes(c -> {
+                            Vector3d pos = getVec3(c, "pos");
+                            PLUGIN_CONFIG.autoLoad.home.x = pos.getX();
+                            PLUGIN_CONFIG.autoLoad.home.y = pos.getY();
+                            PLUGIN_CONFIG.autoLoad.home.z = pos.getZ();
+                            c.getSource().getEmbed()
+                                    .title("SyntaxPearl Home Coords Set")
+                                    .description(formatHomeCoords());
+                            return 0;
+                        })))
+                .executes(c -> {
+                    c.getSource().getEmbed()
+                            .title("SyntaxPearl Home")
+                            .addField("Enabled", toggleStr(PLUGIN_CONFIG.autoLoad.returnHomeEnabled))
+                            .addField("Coords", formatHomeCoords());
+                    return 0;
+                }));
 
         builder.then(literal("autodetect")
                 .then(argument("toggle", toggle()).executes(c -> {
@@ -232,7 +280,7 @@ public class PearlPlusCommand extends Command {
                     }
 
                     c.getSource().getEmbed()
-                            .title("PearlPlus Autodetect " + toggleStrCaps(enabled));
+                            .title("SyntaxPearl Autodetect " + toggleStrCaps(enabled));
                     return 0;
                 }))
                 .then(literal("temp")
@@ -244,7 +292,7 @@ public class PearlPlusCommand extends Command {
                             module.onTemporaryModeToggle(enabled);
 
                             c.getSource().getEmbed()
-                                    .title("PearlPlus Autodetect Temp Mode " + toggleStrCaps(enabled));
+                                    .title("SyntaxPearl Autodetect Temp Mode " + toggleStrCaps(enabled));
                             return 0;
                         }))));
 
@@ -254,7 +302,7 @@ public class PearlPlusCommand extends Command {
                     PLUGIN_CONFIG.autoDetect.distanceCheck = enabled;
 
                     c.getSource().getEmbed()
-                            .title("PearlPlus Distance Check " + toggleStrCaps(enabled));
+                            .title("SyntaxPearl Distance Check " + toggleStrCaps(enabled));
                     return 0;
                 })));
 
@@ -263,7 +311,7 @@ public class PearlPlusCommand extends Command {
                     boolean enabled = getToggle(c, "toggle");
                     PLUGIN_CONFIG.autoLoad.autoDefaultToPresent = enabled;
                     c.getSource().getEmbed()
-                            .title("PearlPlus Auto Default " + toggleStrCaps(enabled));
+                            .title("SyntaxPearl Auto Default " + toggleStrCaps(enabled));
                     return 0;
                 })));
 
@@ -352,6 +400,8 @@ public class PearlPlusCommand extends Command {
                 .addField("Enabled", toggleStr(PLUGIN_CONFIG.autoLoad.enabled))
                 .addField("Default Pearl ID", defaultPearlId)
                 .addField("Return Position", toggleStr(PLUGIN_CONFIG.autoLoad.returnToStartPos))
+                .addField("Home Return", toggleStr(PLUGIN_CONFIG.autoLoad.returnHomeEnabled))
+                .addField("Home Coords", formatHomeCoords())
                 .addField("Strict", toggleStr(!PLUGIN_CONFIG.autoLoad.allowNoiseAfterPearl))
                 .addField("Load Command", PLUGIN_CONFIG.autoLoad.loadCommand)
                 .addField("Autodetect", toggleStr(PLUGIN_CONFIG.autoDetect.enabled))
@@ -367,5 +417,21 @@ public class PearlPlusCommand extends Command {
         return PlayerListsManager.getProfileFromUsername(username)
                 .map(profile -> profile.uuid())
                 .orElse(null);
+    }
+
+    private boolean hasConfiguredHome() {
+        return PLUGIN_CONFIG.autoLoad.home.x != null
+                && PLUGIN_CONFIG.autoLoad.home.y != null
+                && PLUGIN_CONFIG.autoLoad.home.z != null;
+    }
+
+    private String formatHomeCoords() {
+        if (!hasConfiguredHome()) {
+            return "Not set";
+        }
+        return String.format("%.3f %.3f %.3f",
+                PLUGIN_CONFIG.autoLoad.home.x,
+                PLUGIN_CONFIG.autoLoad.home.y,
+                PLUGIN_CONFIG.autoLoad.home.z);
     }
 }

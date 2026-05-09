@@ -10,9 +10,9 @@ import dev.zenith.pearlplus.module.*;
 @Plugin(
     id = BuildConstants.PLUGIN_ID,
     version = BuildConstants.VERSION,
-    description = "Slightly better pearl loading module.",
+    description = "SyntaxPearl: a PearlPlus-based stasis loader fork by Syntaxia Development. Credits to the original PearlPlus developers.",
     url = "https://github.com/duccss/pearlplus/",
-    authors = {"duccss", "steve2b2t", "Leonetic"},
+    authors = {"duccss", "steve2b2t", "Leonetic", "Sleepy", "Syntaxia Development"},
     mcVersions = "*" // mark every version compatible
 )
 
@@ -25,12 +25,12 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
     public void onLoad(PluginAPI pluginAPI) {
         API = pluginAPI;
         LOG = pluginAPI.getLogger();
-        LOG.info("PearlPlus Plugin loading...");
+        LOG.info("SyntaxPearl Plugin loading...");
         PLUGIN_CONFIG = API.registerConfig(BuildConstants.PLUGIN_ID, PearlPlusConfig.class);
         API.registerCommand(new PearlPlusCommand());
         API.registerModule(new AutoLoadModule());
         API.registerModule(new AutoDetectModule());
 
-        LOG.info("PearlPlus Plugin loaded!");
+        LOG.info("SyntaxPearl Plugin loaded!");
     }
 }
