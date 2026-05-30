@@ -7,6 +7,7 @@ import java.util.UUID;
 public class PearlPlusConfig {
     public final AutoLoadConfig autoLoad = new AutoLoadConfig();
     public final AutoDetectConfig autoDetect = new AutoDetectConfig();
+    public final ScannerConfig scanner = new ScannerConfig();
 
     public String defaultPearlId = null;
 
@@ -21,6 +22,7 @@ public class PearlPlusConfig {
         public boolean autoDefaultToPresent = true;
         public boolean whitelistEnabled = false;
         public boolean dropPearlAfterLoad = true;
+        public boolean allowTrapdoorFallback = false;
         public String loadCommand = "load";
         public final HomePosition home = new HomePosition();
     }
@@ -29,7 +31,40 @@ public class PearlPlusConfig {
         public boolean enabled = true;
         public boolean temporaryMode = false;
         public boolean distanceCheck = false;
-        public int temporaryRemovalRange = 32; //blocks
+        public int temporaryRemovalRange = 64; //blocks
+    }
+
+    public static final class ScannerConfig {
+        public boolean enabled = false;
+        public int minIntervalMinutes = 10;
+        public int maxIntervalMinutes = 30;
+        public int searchRadiusBlocks = 50;
+        public int yLevelOffset = 3;
+        public String markerBlockPos = "0,100,0";
+        public String apiEndpoint = "http://localhost:3000/api/chests";
+        public String apiKey = "";
+        public String mergeStrategy = "LATEST_WINS";
+        public boolean customPathEnabled = false;
+        public Map<String, PathPoint> customPath = new LinkedHashMap<>();
+        public Map<String, ScanZone> zones = new LinkedHashMap<>();
+    }
+
+    public static final class PathPoint {
+        public double x;
+        public double y;
+        public double z;
+    }
+
+    public static final class ScanZone {
+        public String type = "STORAGE";
+        public PathPoint pos1;
+        public PathPoint pos2;
+        public Map<String, ScanLane> lanes = new LinkedHashMap<>();
+    }
+
+    public static final class ScanLane {
+        public PathPoint start;
+        public PathPoint end;
     }
 
     public static final class PlayerPearls {
@@ -43,6 +78,8 @@ public class PearlPlusConfig {
         public int x;
         public int y;
         public int z;
+        public int relX;
+        public int relZ;
     }
 
     public static final class HomePosition {

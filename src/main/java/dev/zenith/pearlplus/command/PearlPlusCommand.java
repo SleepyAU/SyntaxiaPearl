@@ -36,11 +36,12 @@ public class PearlPlusCommand extends Command {
             .usageLines(
                 "<on/off>",
                 "list",
+                "clear",
                 "list clear",
                 "add <playerName> <pearlId> <x> <y> <z>",
                 "del <playerName> <pearlId>",
                 "defaultpearlid <word|none>",
-                "load <playerName> <pearlId>",
+                "load <playerName> [pearlId]",
                 "returnpos <on/off>",
                 "home <on/off>",
                 "home coords <x> <y> <z>",
@@ -51,9 +52,10 @@ public class PearlPlusCommand extends Command {
                 "distancecheck <on/off>",
                 "autodefault <on/off>",
                 "whitelist <on/off / add / clear / list / remove>",
-                "droppearlafterload <on/off>"
+                "droppearlafterload <on/off>",
+                "trapdoorfallback <on/off>"
             )
-            .aliases("pp", "pearlplus")
+            .aliases("pp", "pearlplus", "pearl")
             .build();
     }
 
@@ -79,15 +81,7 @@ public class PearlPlusCommand extends Command {
                     return 0;
                 })
                 .then(literal("clear").executes(c -> {
-                    int playerCount = PLUGIN_CONFIG.players.size();
-                    int pearlCount = PLUGIN_CONFIG.players.values().stream()
-                            .mapToInt(playerPearls -> playerPearls.pearls.size())
-                            .sum();
-                    PLUGIN_CONFIG.players.clear();
-                    c.getSource().getEmbed()
-                            .title("Cleared pearls (" + pearlCount + " pearls removed from " + playerCount + " players)");
-                    LOG.info("Cleared pearls ({} pearls removed from {} players)", pearlCount, playerCount);
-                    return 0;
+                    return clearPearls(c);
                 }))
                 .then(argument("playerName", wordWithChars()).executes(c -> {
                     String name = getString(c, "playerName");
@@ -102,6 +96,8 @@ public class PearlPlusCommand extends Command {
                     c.getSource().getEmbed().title("Pearls for " + name).description(pearls);
                     return 0;
                 })));
+
+        builder.then(literal("clear").executes(this::clearPearls));
 
         builder.then(literal("add")
                 .then(argument("playerName", wordWithChars())
@@ -153,32 +149,11 @@ public class PearlPlusCommand extends Command {
                         }))));
 
         builder.then(literal("load")
-                .then(argument("playerName", wordWithChars())
+                .then(argument("playerName", wordWithChars()).executes(c -> {
+                    return loadPearlByName(c, getString(c, "playerName"), null);
+                })
                         .then(argument("pearlId", wordWithChars()).executes(c -> {
-                            String name = getString(c, "playerName");
-                            String pearlId = getString(c, "pearlId");
-                            UUID uuid = resolveUuidByUsername(name);
-                            if (uuid == null) {
-                                c.getSource().getEmbed().title("Invalid username: " + name);
-                                return 0;
-                            }
-
-                            PearlManager manager = new PearlManager(MODULE.get(AutoDetectModule.class));
-                            String resolvedPearlId = manager.resolvePearlId(uuid, pearlId);
-                            if (resolvedPearlId == null) {
-                                c.getSource().getEmbed().title("Pearl not found for " + name);
-                                return 0;
-                            }
-
-                            var playerEntry = PLUGIN_CONFIG.players.get(uuid);
-                            if (playerEntry == null || !playerEntry.pearls.containsKey(resolvedPearlId)) {
-                                c.getSource().getEmbed().title("No authorized pearls found for " + name);
-                                return 0;
-                            }
-
-                            manager.loadPearl(playerEntry.pearls.get(resolvedPearlId), null);
-                            c.getSource().getEmbed().title("Loading pearl " + resolvedPearlId + " for " + name);
-                            return 0;
+                            return loadPearlByName(c, getString(c, "playerName"), getString(c, "pearlId"));
                         }))));
         
         builder.then(literal("defaultpearlid")
@@ -381,12 +356,24 @@ public class PearlPlusCommand extends Command {
                     return 0;
                 })));
                 
-                builder.then(literal("droppearlafterload")
+        builder.then(literal("droppearlafterload")
                 .then(argument("toggle", toggle()).executes(c -> {
                     boolean dropPearlAfterLoad = getToggle(c, "toggle");
                     PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad = dropPearlAfterLoad;
                     c.getSource().getEmbed()
                             .title("Drop pearl after load " + toggleStrCaps(dropPearlAfterLoad));
+                    return 0;
+                })));
+
+        builder.then(literal("trapdoorfallback")
+                .then(argument("toggle", toggle()).executes(c -> {
+                    boolean enabled = getToggle(c, "toggle");
+                    PLUGIN_CONFIG.autoLoad.allowTrapdoorFallback = enabled;
+                    c.getSource().getEmbed()
+                            .title("Physical trapdoor fallback " + toggleStrCaps(enabled))
+                            .description(enabled
+                                    ? "Pearls without lectern mappings may use legacy physical loading."
+                                    : "Pearls without lectern mappings will fail safely instead of pathing to pearl coordinates.");
                     return 0;
                 })));
 
@@ -410,7 +397,50 @@ public class PearlPlusCommand extends Command {
                 .addField("Auto Default", toggleStr(PLUGIN_CONFIG.autoLoad.autoDefaultToPresent))
                 .addField("Whitelist", toggleStr(PLUGIN_CONFIG.autoLoad.whitelistEnabled))
                 .addField("Drop Pearl After Load", toggleStr(PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad))
+                .addField("Physical Fallback", toggleStr(PLUGIN_CONFIG.autoLoad.allowTrapdoorFallback))
                 .primaryColor();
+    }
+
+    private int loadPearlByName(final com.mojang.brigadier.context.CommandContext<CommandContext> c,
+                                final String name,
+                                final String pearlId) {
+        UUID uuid = resolveUuidByUsername(name);
+        if (uuid == null) {
+            c.getSource().getEmbed().title("Invalid username: " + name);
+            return 0;
+        }
+
+        PearlManager manager = MODULE.get(AutoLoadModule.class).pearlManager();
+        String resolvedPearlId = pearlId == null || pearlId.isBlank()
+                ? manager.defaultPearlId(uuid)
+                : manager.resolvePearlId(uuid, pearlId);
+        if (resolvedPearlId == null) {
+            c.getSource().getEmbed().title("Pearl not found for " + name);
+            return 0;
+        }
+
+        var playerEntry = PLUGIN_CONFIG.players.get(uuid);
+        if (playerEntry == null || !playerEntry.pearls.containsKey(resolvedPearlId)) {
+            c.getSource().getEmbed().title("No authorized pearls found for " + name);
+            return 0;
+        }
+
+        manager.loadPearl(playerEntry.pearls.get(resolvedPearlId), name);
+        c.getSource().getEmbed().title("Loading pearl " + resolvedPearlId + " for " + name);
+        return 0;
+    }
+
+    private int clearPearls(final com.mojang.brigadier.context.CommandContext<CommandContext> c) {
+        int playerCount = PLUGIN_CONFIG.players.size();
+        int pearlCount = PLUGIN_CONFIG.players.values().stream()
+                .mapToInt(playerPearls -> playerPearls.pearls.size())
+                .sum();
+        PLUGIN_CONFIG.players.clear();
+        MODULE.get(AutoDetectModule.class).markExistingPearls();
+        c.getSource().getEmbed()
+                .title("Cleared pearls (" + pearlCount + " pearls removed from " + playerCount + " players)");
+        LOG.info("Cleared pearls ({} pearls removed from {} players)", pearlCount, playerCount);
+        return 0;
     }
 
     private UUID resolveUuidByUsername(final String username) {

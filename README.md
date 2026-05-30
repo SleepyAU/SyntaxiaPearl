@@ -4,6 +4,8 @@ SyntaxPearl is a Syntaxia Development fork of PearlPlus. It automatically detect
 Credits to the original PearlPlus developers: duccss, steve2b2t, and Leonetic.
 The config is saved to `plugins/config/syntaxpearl.json`
 
+This fork also supports mapped redstone/lectern stasis chambers and can run the stash chest scanner that posts scan data to the dashboard API.
+
 Place `SyntaxPearl-2.1.0.jar` in your proxy's plugin folder, or build it from this fork and use the generated jar from `build/libs/`.
 
 This plugin **WILL NOT WORK** unless a correct `chatschema` is set in Zenith. Most vanilla servers like 2b2t and Constantiam don't require you to set one but other servers with custom whisper builders for example 9b9t will need one. Please check the wiki [here](https://wiki.2b2t.vc/Commands/#chatschema).
@@ -67,6 +69,28 @@ pearlplus whitelist clear
 pearlplus droppearlafterload <on/off>
 ```
 
+```bash
+stashscan <on/off>
+stashscan scan
+stashscan status
+stashscan cancel
+stashscan clear
+customPath <on/off>
+customPath <1-20> coords <x> <y> <z>
+customPath reset
+stashscan return
+scanzone list
+scanzone add <name> <storage|withdrawal|ignore>
+scanzone <name> pos1 here
+scanzone <name> pos2 here
+scanzone <name> bounds <x1 y1 z1> <x2 y2 z2>
+scanzone <name> lane <1-20> start here
+scanzone <name> lane <1-20> end here
+scanzone <name> lane <1-20> clear
+```
+
+`stashscan` also accepts the aliases `chestscan` and `cheststcan`.
+
 ### In-game Whisper Commands
 
 There are a few in-game commands players can whisper to the bot to manage their pearls.
@@ -91,6 +115,43 @@ Can be enabled with `pp autodetect temp on`
 
 #### Manual setup
 Use the `pp add/del` commands to set up manually.
+
+#### Lectern/redstone chambers
+
+Lectern chamber mappings are loaded from `chambers.json` in the plugin jar. When a stored pearl matches a mapped chamber relative to the configured home position, SyntaxPearl will open the matching lectern, select the configured page, close the lectern UI, and press the mapped pull button. Pearls that do not match a lectern mapping keep using the existing trapdoor/stored-block loading path.
+
+Set home coordinates before using mapped lectern chambers:
+
+```bash
+pp home coords <x> <y> <z>
+```
+
+#### Stash scanner
+
+The stash scanner is disabled by default. Configure these fields in `plugins/config/syntaxpearl.json`, then enable it with `stashscan on`:
+
+```json
+"scanner": {
+  "enabled": false,
+  "minIntervalMinutes": 10,
+  "maxIntervalMinutes": 30,
+  "searchRadiusBlocks": 50,
+  "yLevelOffset": 3,
+  "markerBlockPos": "0,100,0",
+  "apiEndpoint": "http://127.0.0.1:3000/api/chests",
+  "apiKey": "your-api-key",
+  "mergeStrategy": "LATEST_WINS",
+  "customPathEnabled": false,
+  "customPath": {},
+  "zones": {}
+}
+```
+
+The scanner only sends chest IDs, chest type, dimension, and item contents to the API. Chest coordinates are used locally while scanning and are not sent to the dashboard API.
+
+`customPath` configures up to 20 scanner travel waypoints. Set a point to `0 0 0` or run `customPath reset` to clear it. When a pearl load is requested during a scan, the scanner pauses, remembers unread chests, loads the pearl, and resumes the remaining chest queue afterward. After a custom-path scan, the scanner can use the highest custom waypoint Y as the upper return level, walk to the marker X/Z, and drop back to the marker; `stashscan return` runs that marker-return step manually. `stashscan clear` asks the dashboard API to clear indexed stash data and is intended for debugging.
+
+`scanzone` configures named scan regions and lane order. Zone names are arbitrary labels; zone type controls behavior. `storage` zones are scanned first, `withdrawal` zones are scanned last, and `ignore` zones are skipped. Use `here` while standing at each corner or lane endpoint to avoid typing coordinates. When zones with lanes are configured, the scanner orders chests by zone and lane instead of choosing the closest chest globally.
 
 #### 2b2t / Anti-spam
 

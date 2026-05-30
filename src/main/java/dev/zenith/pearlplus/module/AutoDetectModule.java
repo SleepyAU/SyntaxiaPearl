@@ -73,6 +73,7 @@ public class AutoDetectModule extends Module {
     public void markExistingPearls() {
         var cache = CACHE.getEntityCache();
         trackedPearls.clear();
+        acknowledgedColumns.clear();
         if (cache == null) {
             return;
         }

@@ -15,6 +15,10 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 public class AutoLoadModule extends Module {
     private final PearlManager pearlManager = new PearlManager(this);
 
+    public PearlManager pearlManager() {
+        return pearlManager;
+    }
+
     @Override
     public boolean enabledSetting() {
         return PLUGIN_CONFIG.autoLoad.enabled;
@@ -171,6 +175,11 @@ public class AutoLoadModule extends Module {
         if (!pearlManager.isPearlPresent(pearl)) {
             sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("No pearl detected for " + requestedPearl + ".")));
             return;
+        }
+
+        if (pearlManager.pauseScannerForPearlLoad()) {
+            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name,
+                    PearlManager.prefixMessage("Pausing Chest Indexing, coming to load your pearl.")));
         }
 
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Loading pearl " + requestedPearl + "... " + pearlFeedback)));

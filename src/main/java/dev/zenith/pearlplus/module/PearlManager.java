@@ -18,6 +18,7 @@ import com.zenith.feature.player.raycast.RaycastHelper;
 import com.zenith.feature.player.raycast.RayIntersection;
 import com.zenith.mc.block.Direction;
 import com.zenith.module.impl.KillAura;
+import com.zenith.util.RequestFuture;
 import org.cloudburstmc.math.vector.Vector2f;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
@@ -25,6 +26,8 @@ import dev.zenith.pearlplus.PearlPlusConfig;
 import com.zenith.module.api.Module;
 
 import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -42,9 +45,12 @@ public class PearlManager {
     private static final int PEARLPLUS_ACTION_PRIORITY = 1500;
     public static final String MESSAGE_PREFIX = "[SyntaxPearl] ";
     private static final long IDLE_HOME_INTERVAL_MS = 10_000L;
-    private static final double HOME_REACHED_DISTANCE_SQ = 0.36D;
+    private static final double HOME_REACHED_DISTANCE_SQ = 1.0D;
     private static final long TRAPDOOR_SEQUENCE_DELAY_MS = 75L;
     private static final long ACTION_TIMEOUT_MS = 15_000L;
+    private static final int LECTERN_OPEN_MAX_TICKS = 60;
+    private static final int LECTERN_CLOSE_MAX_TICKS = 40;
+    private static final Path EXTERNAL_ACTION_LOCK = Path.of(System.getProperty("java.io.tmpdir"), "syntaxia-chest-scan-active.lock");
 
     private final Module notifier;
     private int killAuraSuppressionDepth = 0;
@@ -54,6 +60,33 @@ public class PearlManager {
     private long trapdoorSequenceId = 0L;
     private long actionStartedAtMs = 0L;
     private String actionDescription = "";
+    private LecternFlow pendingLecternFlow = null;
+    private boolean resumeScannerAfterAction = false;
+
+    private enum LecternPhase { WAITING_FOR_OPEN, WAITING_FOR_CLOSE }
+
+    private static final class LecternFlow {
+        final PearlPlusConfig.StoredPearl pearl;
+        final String requesterName;
+        final BlockPos startPos;
+        final int buttonId;
+        final int[] buttonWorld;
+        LecternPhase phase = LecternPhase.WAITING_FOR_OPEN;
+        int ticksInPhase = 0;
+        RequestFuture inventoryFuture;
+
+        LecternFlow(final PearlPlusConfig.StoredPearl pearl,
+                    final String requesterName,
+                    final BlockPos startPos,
+                    final int buttonId,
+                    final int[] buttonWorld) {
+            this.pearl = pearl;
+            this.requesterName = requesterName;
+            this.startPos = startPos;
+            this.buttonId = buttonId;
+            this.buttonWorld = buttonWorld;
+        }
+    }
 
     public PearlManager(Module notifier) {
         this.notifier = notifier;
@@ -70,6 +103,31 @@ public class PearlManager {
         return actionInProgress;
     }
 
+    private boolean scannerBusy() {
+        try {
+            ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            return scannerModule != null && scannerModule.isScanActive();
+        } catch (final Exception e) {
+            return false;
+        }
+    }
+
+    private boolean tryScannerReturnHome() {
+        if (!PLUGIN_CONFIG.scanner.customPathEnabled) {
+            return false;
+        }
+        try {
+            ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            if (scannerModule != null && scannerModule.returnToMarker()) {
+                info("Idle recovery using scanner marker return");
+                return true;
+            }
+        } catch (final Exception e) {
+            LOG.debug("Scanner marker return unavailable for idle recovery", e);
+        }
+        return false;
+    }
+
     private void beginAction(final String description) {
         actionInProgress = true;
         actionStartedAtMs = System.currentTimeMillis();
@@ -80,6 +138,44 @@ public class PearlManager {
         actionInProgress = false;
         actionStartedAtMs = 0L;
         actionDescription = "";
+    }
+
+    private void completeAction() {
+        endAction();
+        releaseKillAuraSuppression();
+        resumeScannerAfterPearlLoad();
+    }
+
+    public boolean pauseScannerForPearlLoad() {
+        if (resumeScannerAfterAction) {
+            return false;
+        }
+        try {
+            ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            if (scannerModule != null && scannerModule.pauseForPearlRequest()) {
+                resumeScannerAfterAction = true;
+                info("Paused chest indexing for pearl load request");
+                return true;
+            }
+        } catch (final Exception e) {
+            LOG.warn("Failed to pause chest scanner for pearl load", e);
+        }
+        return false;
+    }
+
+    private void resumeScannerAfterPearlLoad() {
+        if (!resumeScannerAfterAction) {
+            return;
+        }
+        resumeScannerAfterAction = false;
+        try {
+            ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            if (scannerModule != null && scannerModule.resumePausedScan()) {
+                info("Resumed chest indexing after pearl load");
+            }
+        } catch (final Exception e) {
+            LOG.warn("Failed to resume chest scanner after pearl load", e);
+        }
     }
 
     public Optional<PlayerPearl> findPearl(UUID ownerUuid, String pearlId) {
@@ -111,7 +207,64 @@ public class PearlManager {
         stored.x = x;
         stored.y = y;
         stored.z = z;
+        applyRelativeCoords(stored);
         return stored;
+    }
+
+    private void applyRelativeCoords(final PearlPlusConfig.StoredPearl stored) {
+        if (stored == null) {
+            return;
+        }
+        if (!hasConfiguredHome()) {
+            stored.relX = 0;
+            stored.relZ = 0;
+            return;
+        }
+        stored.relX = stored.x - (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.x);
+        stored.relZ = stored.z - (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.z);
+    }
+
+    public Optional<ChamberLookup.Hit> lecternFor(final PearlPlusConfig.StoredPearl pearl) {
+        if (pearl == null) {
+            return Optional.empty();
+        }
+        int relX = pearl.relX;
+        int relZ = pearl.relZ;
+        if (hasConfiguredHome()) {
+            relX = pearl.x - (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.x);
+            relZ = pearl.z - (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.z);
+        }
+        return ChamberLookup.lookup(relX, relZ);
+    }
+
+    public static void backfillRelativeCoords() {
+        if (PLUGIN_CONFIG == null || PLUGIN_CONFIG.players == null) {
+            return;
+        }
+        if (PLUGIN_CONFIG.autoLoad.home.x == null || PLUGIN_CONFIG.autoLoad.home.z == null) {
+            LOG.info("Skipping pearl relative-coordinate backfill: home is not configured");
+            return;
+        }
+
+        int homeX = (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.x);
+        int homeZ = (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.z);
+        int updated = 0;
+        for (PearlPlusConfig.PlayerPearls entry : PLUGIN_CONFIG.players.values()) {
+            if (entry == null || entry.pearls == null) {
+                continue;
+            }
+            for (PearlPlusConfig.StoredPearl pearl : entry.pearls.values()) {
+                if (pearl == null) {
+                    continue;
+                }
+                pearl.relX = pearl.x - homeX;
+                pearl.relZ = pearl.z - homeZ;
+                updated++;
+            }
+        }
+        if (updated > 0) {
+            LOG.info("Backfilled relative coordinates for {} stored pearls", updated);
+        }
     }
 
     public void removePearl(UUID ownerUuid, String pearlId) {
@@ -488,14 +641,12 @@ public class PearlManager {
                                         .description("Returned to start pos")
                                         .successColor()
                         );
-                        endAction();
-                        releaseKillAuraSuppression();
+                        completeAction();
                     });
             return;
         }
 
-        endAction();
-        releaseKillAuraSuppression();
+        completeAction();
     }
 
     private boolean hasConfiguredHome() {
@@ -521,8 +672,7 @@ public class PearlManager {
                     } else {
                         notifyReturnedHome(homeX, homeY, homeZ);
                     }
-                    endAction();
-                    releaseKillAuraSuppression();
+                    completeAction();
                 });
     }
 
@@ -769,10 +919,12 @@ public class PearlManager {
 
     public void loadPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
         if (pearl == null) {
+            resumeScannerAfterPearlLoad();
             return;
         }
         if (actionInProgress) {
             info("Ignoring pearl load request while another SyntaxPearl action is already running");
+            resumeScannerAfterPearlLoad();
             return;
         }
         Proxy proxy = Proxy.getInstance();
@@ -781,6 +933,7 @@ public class PearlManager {
                     .title("Can't Load Pearl")
                     .description("Bot is not online")
                     .errorColor());
+            resumeScannerAfterPearlLoad();
             return;
         }
         if (proxy.hasActivePlayer()) {
@@ -788,6 +941,26 @@ public class PearlManager {
                     .title("Can't Load Pearl")
                     .description("Player is controlling")
                     .errorColor());
+            resumeScannerAfterPearlLoad();
+            return;
+        }
+
+        pauseScannerForPearlLoad();
+
+        Optional<ChamberLookup.Hit> lecternHit = lecternFor(pearl);
+        if (lecternHit.isPresent()) {
+            loadPearlViaLectern(pearl, requesterName, lecternHit.get());
+            return;
+        }
+
+        if (!PLUGIN_CONFIG.autoLoad.allowTrapdoorFallback) {
+            info("No lectern chamber mapping found for pearl " + pearl.pearlId + "; physical trapdoor fallback is disabled");
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("No lectern chamber mapping found for pearl " + pearl.pearlId
+                            + ". Physical trapdoor fallback is disabled.")
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
             return;
         }
 
@@ -883,17 +1056,265 @@ public class PearlManager {
                 .primaryColor());
     }
 
+    private void loadPearlViaLectern(final PearlPlusConfig.StoredPearl pearl,
+                                     final String requesterName,
+                                     final ChamberLookup.Hit hit) {
+        if (!hasConfiguredHome()) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("Home is not configured; lectern chambers need home coordinates")
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
+            return;
+        }
+
+        int[] lecternRel = ChamberLookup.parseCoord(hit.lectern());
+        if (lecternRel == null) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("Malformed lectern coordinate in chambers.json: " + hit.lectern())
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
+            return;
+        }
+
+        int homeBlockX = (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.x);
+        int homeBlockZ = (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.z);
+        int lecternX = homeBlockX + lecternRel[0];
+        int lecternZ = homeBlockZ + lecternRel[1];
+
+        Integer lecternY = findLecternY(lecternX, lecternZ, pearl.y);
+        if (lecternY == null) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("No lectern found at " + lecternX + "," + lecternZ)
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
+            return;
+        }
+
+        int[] buttonWorld = resolveButtonWorld(hit, homeBlockX, homeBlockZ, pearl.y);
+        int buttonId = 100 + (hit.page() - 1);
+
+        acquireKillAuraSuppression();
+        beginAction("load pearl " + pearl.pearlId + " via lectern");
+
+        if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
+            ensurePearlsAvailable();
+        }
+
+        BlockPos startPos = CACHE.getPlayerCache().getThePlayer().blockPos();
+        BlockPos lecternPos = new BlockPos(lecternX, lecternY, lecternZ);
+        BlockPos walkPos = findAdjacentWalkableBlock(lecternPos);
+
+        int pathX = walkPos != null ? (int) walkPos.x() : lecternX;
+        int pathY = walkPos != null ? (int) walkPos.y() : Math.max(lecternY - 1, 0);
+        int pathZ = walkPos != null ? (int) walkPos.z() : lecternZ;
+
+        info("Loading pearl " + pearl.pearlId + " via lectern at ["
+                + lecternX + ", " + lecternY + ", " + lecternZ
+                + "] page " + hit.page()
+                + (buttonWorld == null
+                    ? " without a pull button"
+                    : " then button at [" + buttonWorld[0] + ", " + buttonWorld[1] + ", " + buttonWorld[2] + "]"));
+
+        notifier.discordAndIngameNotification(buildLecternLoadingEmbed(pearl, hit));
+
+        if (isWithinBlockInteractRange(lecternX, lecternY, lecternZ)) {
+            rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld);
+            return;
+        }
+
+        BARITONE.pathTo(pathX, pathY, pathZ)
+                .addExecutedListener(future ->
+                        rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld));
+    }
+
+    private int[] resolveButtonWorld(final ChamberLookup.Hit hit,
+                                     final int homeBlockX,
+                                     final int homeBlockZ,
+                                     final int referenceY) {
+        if (hit.button() == null) {
+            return null;
+        }
+
+        int[] buttonRel = ChamberLookup.parseCoord(hit.button());
+        if (buttonRel == null) {
+            info("Malformed button coordinate in chambers.json for lectern " + hit.lectern() + ": " + hit.button());
+            return null;
+        }
+
+        int buttonX = homeBlockX + buttonRel[0];
+        int buttonZ = homeBlockZ + buttonRel[1];
+        Integer buttonY = findButtonY(buttonX, buttonZ, referenceY);
+        if (buttonY == null) {
+            info("No button found at " + buttonX + "," + buttonZ + " for lectern " + hit.lectern());
+            return null;
+        }
+        return new int[] {buttonX, buttonY, buttonZ};
+    }
+
+    private Integer findLecternY(final int x, final int z, final int referenceY) {
+        return findBlockYInColumn(x, z, referenceY, name -> name.equals("lectern") || name.endsWith(":lectern"));
+    }
+
+    private Integer findButtonY(final int x, final int z, final int referenceY) {
+        return findBlockYInColumn(x, z, referenceY, name -> name.endsWith("_button"));
+    }
+
+    private Integer findBlockYInColumn(final int x,
+                                       final int z,
+                                       final int referenceY,
+                                       final Predicate<String> nameMatch) {
+        if (CACHE == null || CACHE.getChunkCache() == null) {
+            return null;
+        }
+
+        Integer best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (int dy = -16; dy <= 16; dy++) {
+            int y = referenceY + dy;
+            var section = CACHE.getChunkCache().getChunkSection(x, y, z);
+            if (section == null) {
+                continue;
+            }
+
+            int stateId = section.getBlock(x & 15, y & 15, z & 15);
+            if (stateId == 0) {
+                continue;
+            }
+
+            var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+            if (block == null || block.name() == null || !nameMatch.test(block.name())) {
+                continue;
+            }
+
+            int dist = Math.abs(dy);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = y;
+            }
+        }
+        return best;
+    }
+
+    private boolean isWithinBlockInteractRange(final int x, final int y, final int z) {
+        if (CACHE == null || CACHE.getPlayerCache() == null || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+
+        var player = CACHE.getPlayerCache().getThePlayer();
+        double dx = (x + 0.5D) - player.getX();
+        double dy = (y + 0.5D) - player.getY();
+        double dz = (z + 0.5D) - player.getZ();
+        return (dx * dx + dy * dy + dz * dz) <= TRAPDOOR_INTERACT_DISTANCE_SQ;
+    }
+
+    private void rightClickLecternAndFlip(final PearlPlusConfig.StoredPearl pearl,
+                                          final String requesterName,
+                                          final BlockPos startPos,
+                                          final int lecternX,
+                                          final int lecternY,
+                                          final int lecternZ,
+                                          final int buttonId,
+                                          final int[] buttonWorld) {
+        BARITONE.rightClickBlock(lecternX, lecternY, lecternZ)
+                .addExecutedListener(f ->
+                        pendingLecternFlow = new LecternFlow(pearl, requesterName, startPos, buttonId, buttonWorld));
+    }
+
+    private void advanceLecternFlow() {
+        LecternFlow flow = pendingLecternFlow;
+        if (flow == null) {
+            return;
+        }
+
+        flow.ticksInPhase++;
+        int openContainer = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+
+        if (flow.phase == LecternPhase.WAITING_FOR_OPEN) {
+            if (openContainer != 0) {
+                flow.inventoryFuture = INVENTORY.submit(InventoryActionRequest.builder()
+                        .owner(this)
+                        .actions(
+                                new com.zenith.feature.inventory.actions.ContainerButtonClick(openContainer, flow.buttonId),
+                                new com.zenith.feature.inventory.actions.CloseContainer())
+                        .priority(PEARLPLUS_ACTION_PRIORITY)
+                        .build());
+                info("Flipped lectern container " + openContainer + " to page " + (flow.buttonId - 99)
+                        + " for pearl " + flow.pearl.pearlId);
+                if (flow.buttonWorld == null) {
+                    pendingLecternFlow = null;
+                    finishPearlLoad(flow.pearl, flow.requesterName, flow.startPos);
+                    return;
+                }
+                flow.phase = LecternPhase.WAITING_FOR_CLOSE;
+                flow.ticksInPhase = 0;
+                return;
+            }
+
+            if (flow.ticksInPhase >= LECTERN_OPEN_MAX_TICKS) {
+                info("Lectern container never opened for pearl " + flow.pearl.pearlId);
+                notifier.discordAndIngameNotification(Embed.builder()
+                        .title("Load Failed")
+                        .description("Lectern UI did not open for pearl " + flow.pearl.pearlId)
+                        .errorColor());
+                pendingLecternFlow = null;
+                completeAction();
+            }
+            return;
+        }
+
+        boolean inventoryDone = flow.inventoryFuture != null && flow.inventoryFuture.isDone();
+        boolean closeConfirmed = inventoryDone && openContainer == 0;
+        if (closeConfirmed || flow.ticksInPhase >= LECTERN_CLOSE_MAX_TICKS) {
+            if (!closeConfirmed) {
+                info("Lectern close not confirmed after " + flow.ticksInPhase + " ticks; clicking pull button anyway");
+            }
+            int[] button = flow.buttonWorld;
+            PearlPlusConfig.StoredPearl pearl = flow.pearl;
+            String requesterName = flow.requesterName;
+            BlockPos startPos = flow.startPos;
+            pendingLecternFlow = null;
+            info("Right-clicking pull button at [" + button[0] + ", " + button[1] + ", " + button[2] + "]");
+            BARITONE.rightClickBlock(button[0], button[1], button[2])
+                    .addExecutedListener(f -> finishPearlLoad(pearl, requesterName, startPos));
+        }
+    }
+
+    private Embed buildLecternLoadingEmbed(final PearlPlusConfig.StoredPearl pearl,
+                                           final ChamberLookup.Hit hit) {
+        return Embed.builder()
+                .title("Loading Pearl")
+                .addField("Pearl", pearl.pearlId, false)
+                .addField("Lectern", hit.lectern(), true)
+                .addField("Page", String.valueOf(hit.page()), true)
+                .primaryColor();
+    }
+
     public void tickIdleHomeCheck(final long now) {
+        advanceLecternFlow();
+        if (scannerBusy()) {
+            if (actionInProgress && "idle return home".equals(actionDescription)) {
+                info("Idle recovery standing down while chest scanner is active");
+                endAction();
+                releaseKillAuraSuppression();
+            }
+            return;
+        }
         if (actionInProgress && now - actionStartedAtMs >= ACTION_TIMEOUT_MS) {
             info("SyntaxPearl action timed out: " + actionDescription + ". Stopping Baritone and clearing action state");
             BARITONE.stop();
-            endAction();
-            releaseKillAuraSuppression();
+            pendingLecternFlow = null;
+            completeAction();
         }
         if (!PLUGIN_CONFIG.autoLoad.returnHomeEnabled || !hasConfiguredHome()) {
             return;
         }
         if (actionInProgress || now - lastIdleHomeAttemptMs < IDLE_HOME_INTERVAL_MS) {
+            return;
+        }
+        if (Files.exists(EXTERNAL_ACTION_LOCK)) {
             return;
         }
 
@@ -906,6 +1327,10 @@ public class PearlManager {
         }
 
         lastIdleHomeAttemptMs = now;
+        if (tryScannerReturnHome()) {
+            return;
+        }
+
         acquireKillAuraSuppression();
         beginAction("idle return home");
         info("Idle recovery detected bot away from home, pathing back");
@@ -978,23 +1403,32 @@ public class PearlManager {
     }
 
     public String nextAvailablePearlId(UUID ownerUuid, String ownerName) {
-        PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.get(ownerUuid);
-        String base;
-        if (ownerName == null || ownerName.isBlank()) {
-            base = "pearl";
-        } else {
-            base = ownerName.replaceAll("\\s+", "");
-        }
-
-        int suffix = 1;
-        while (suffix < 10_000) {
-            String candidate = base + suffix;
-            if (entry == null || !entry.pearls.containsKey(candidate)) {
+        int nextId = 1;
+        while (nextId < 10_000) {
+            String candidate = String.valueOf(nextId);
+            if (!pearlIdExists(candidate)) {
                 return candidate;
             }
-            suffix++;
+            nextId++;
         }
         return null;
+    }
+
+    private boolean pearlIdExists(final String candidate) {
+        if (candidate == null || PLUGIN_CONFIG.players == null) {
+            return false;
+        }
+        for (PearlPlusConfig.PlayerPearls playerPearls : PLUGIN_CONFIG.players.values()) {
+            if (playerPearls == null || playerPearls.pearls == null) {
+                continue;
+            }
+            for (String pearlId : playerPearls.pearls.keySet()) {
+                if (candidate.equalsIgnoreCase(pearlId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public void info(String message) {

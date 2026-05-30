@@ -6,6 +6,10 @@ import com.zenith.plugin.api.ZenithProxyPlugin;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 import dev.zenith.pearlplus.command.*;
 import dev.zenith.pearlplus.module.*;
+import dev.zenith.pearlplus.scanner.ChestScanCommand;
+import dev.zenith.pearlplus.scanner.CustomPathCommand;
+import dev.zenith.pearlplus.scanner.ScanZoneCommand;
+import dev.zenith.pearlplus.scanner.StashWithdrawCommand;
 
 @Plugin(
     id = BuildConstants.PLUGIN_ID,
@@ -27,9 +31,18 @@ public class PearlPlusPlugin implements ZenithProxyPlugin {
         LOG = pluginAPI.getLogger();
         LOG.info("SyntaxPearl Plugin loading...");
         PLUGIN_CONFIG = API.registerConfig(BuildConstants.PLUGIN_ID, PearlPlusConfig.class);
+        ChamberLookup.load();
+        PearlManager.backfillRelativeCoords();
+        ChestScannerModule chestScannerModule = new ChestScannerModule();
         API.registerCommand(new PearlPlusCommand());
+        API.registerCommand(new ChestScanCommand(chestScannerModule));
+        API.registerCommand(new StashWithdrawCommand(chestScannerModule));
+        API.registerCommand(new CustomPathCommand());
+        API.registerCommand(new ScanZoneCommand());
         API.registerModule(new AutoLoadModule());
         API.registerModule(new AutoDetectModule());
+        API.registerModule(chestScannerModule);
+        API.registerModule(new DiscordBridgeModule());
 
         LOG.info("SyntaxPearl Plugin loaded!");
     }
