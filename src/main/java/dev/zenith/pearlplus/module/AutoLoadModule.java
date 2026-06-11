@@ -177,14 +177,11 @@ public class AutoLoadModule extends Module {
             return;
         }
 
-        if (pearlManager.pauseScannerForPearlLoad()) {
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name,
-                    PearlManager.prefixMessage("Pausing Chest Indexing, coming to load your pearl.")));
-        }
-
-        sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage("Loading pearl " + requestedPearl + "... " + pearlFeedback)));
-
-        pearlManager.loadPearl(pearl, name);
+        int queuePosition = pearlManager.loadPearl(pearl, name);
+        String queueText = queuePosition <= 1
+                ? "Loading pearl " + requestedPearl + "..."
+                : "Queued pearl " + requestedPearl + " at position " + queuePosition + ".";
+        sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, PearlManager.prefixMessage(queueText + " " + pearlFeedback)));
         
     }
 }

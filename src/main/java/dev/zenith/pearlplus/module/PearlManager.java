@@ -28,7 +28,9 @@ import com.zenith.module.api.Module;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +52,7 @@ public class PearlManager {
     private static final long ACTION_TIMEOUT_MS = 15_000L;
     private static final long PAUSED_SCANNER_HOME_WAIT_MS = 45_000L;
     private static final long HOME_SETTLE_WAIT_MS = 1_500L;
+    private static final long INSTANT_PEARL_WAIT_MS = 120_000L;
     private static final int LECTERN_OPEN_MAX_TICKS = 60;
     private static final int LECTERN_CLOSE_MAX_TICKS = 40;
     private static final Path EXTERNAL_ACTION_LOCK = Path.of(System.getProperty("java.io.tmpdir"), "syntaxia-chest-scan-active.lock");
@@ -64,8 +67,17 @@ public class PearlManager {
     private String actionDescription = "";
     private LecternFlow pendingLecternFlow = null;
     private boolean resumeScannerAfterAction = false;
+    private boolean pearlLoadStarting = false;
+    private final Deque<QueuedPearlLoad> pearlLoadQueue = new ArrayDeque<>();
 
-    private enum LecternPhase { WAITING_FOR_OPEN, WAITING_FOR_CLOSE }
+    private enum PearlLoadMode { NORMAL, INSTANT }
+
+    private enum LecternPhase { WAITING_FOR_OPEN, WAITING_FOR_CLOSE, WAITING_FOR_TARGET_ONLINE }
+
+    private record QueuedPearlLoad(PearlPlusConfig.StoredPearl pearl,
+                                   String requesterName,
+                                   PearlLoadMode mode,
+                                   long createdAtMs) { }
 
     private static final class LecternFlow {
         final PearlPlusConfig.StoredPearl pearl;
@@ -73,6 +85,8 @@ public class PearlManager {
         final BlockPos startPos;
         final int buttonId;
         final int[] buttonWorld;
+        final PearlLoadMode mode;
+        final long instantDeadlineMs;
         LecternPhase phase = LecternPhase.WAITING_FOR_OPEN;
         int ticksInPhase = 0;
         RequestFuture inventoryFuture;
@@ -81,12 +95,17 @@ public class PearlManager {
                     final String requesterName,
                     final BlockPos startPos,
                     final int buttonId,
-                    final int[] buttonWorld) {
+                    final int[] buttonWorld,
+                    final PearlLoadMode mode) {
             this.pearl = pearl;
             this.requesterName = requesterName;
             this.startPos = startPos;
             this.buttonId = buttonId;
             this.buttonWorld = buttonWorld;
+            this.mode = mode;
+            this.instantDeadlineMs = mode == PearlLoadMode.INSTANT
+                    ? System.currentTimeMillis() + INSTANT_PEARL_WAIT_MS
+                    : 0L;
         }
     }
 
@@ -146,6 +165,7 @@ public class PearlManager {
         endAction();
         releaseKillAuraSuppression();
         resumeScannerAfterPearlLoad();
+        processPearlQueue();
     }
 
     public boolean pauseScannerForPearlLoad() {
@@ -975,15 +995,75 @@ public class PearlManager {
         return null;
     }
 
-    public void loadPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
+    public int loadPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
+        return queuePearlLoad(pearl, requesterName, PearlLoadMode.NORMAL);
+    }
+
+    public int instantPearl(PearlPlusConfig.StoredPearl pearl, String requesterName) {
+        return queuePearlLoad(pearl, requesterName, PearlLoadMode.INSTANT);
+    }
+
+    public synchronized int queuedPearlLoadCount() {
+        return pearlLoadQueue.size();
+    }
+
+    private int queuePearlLoad(final PearlPlusConfig.StoredPearl pearl,
+                               final String requesterName,
+                               final PearlLoadMode mode) {
         if (pearl == null) {
             resumeScannerAfterPearlLoad();
-            return;
+            return 0;
         }
-        if (actionInProgress) {
-            info("Ignoring pearl load request while another SyntaxPearl action is already running");
-            return;
+
+        final int position;
+        synchronized (this) {
+            position = pearlLoadQueue.size() + (actionInProgress || pearlLoadStarting ? 1 : 0) + 1;
+            pearlLoadQueue.addLast(new QueuedPearlLoad(pearl, requesterName, mode, System.currentTimeMillis()));
         }
+        info((mode == PearlLoadMode.INSTANT ? "Queued instant pearl " : "Queued pearl ")
+                + pearl.pearlId + " for " + requesterName + " at queue position " + position);
+        notifier.discordAndIngameNotification(Embed.builder()
+                .title(mode == PearlLoadMode.INSTANT ? "Instant Pearl Queued" : "Pearl Load Queued")
+                .addField("Player", requesterName == null ? "unknown" : requesterName, true)
+                .addField("Pearl", pearl.pearlId == null ? "unknown" : pearl.pearlId, true)
+                .addField("Position", String.valueOf(position), true)
+                .primaryColor());
+        processPearlQueue();
+        return position;
+    }
+
+    private void processPearlQueue() {
+        while (true) {
+            final QueuedPearlLoad request;
+            synchronized (this) {
+                if (actionInProgress || pendingLecternFlow != null || pearlLoadStarting) {
+                    return;
+                }
+                request = pearlLoadQueue.pollFirst();
+                if (request != null) {
+                    pearlLoadStarting = true;
+                }
+            }
+            if (request == null) {
+                return;
+            }
+            final boolean started;
+            try {
+                started = startPearlLoad(request);
+            } finally {
+                synchronized (this) {
+                    pearlLoadStarting = false;
+                }
+            }
+            if (started) {
+                return;
+            }
+        }
+    }
+
+    private boolean startPearlLoad(final QueuedPearlLoad request) {
+        final PearlPlusConfig.StoredPearl pearl = request.pearl();
+        final String requesterName = request.requesterName();
         Proxy proxy = Proxy.getInstance();
         if (proxy == null || !proxy.isConnected() || proxy.isInQueue()) {
             notifier.discordAndIngameNotification(Embed.builder()
@@ -991,7 +1071,7 @@ public class PearlManager {
                     .description("Bot is not online")
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
         if (proxy.hasActivePlayer()) {
             notifier.discordAndIngameNotification(Embed.builder()
@@ -999,19 +1079,35 @@ public class PearlManager {
                     .description("Player is controlling")
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
+        }
+
+        if (!isPearlPresent(pearl)) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("No pearl detected for " + pearl.pearlId + ".")
+                    .errorColor());
+            return false;
         }
 
         pauseScannerForPearlLoad();
         if (!returnPausedScannerBeforePearlLoad()) {
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
 
         Optional<ChamberLookup.Hit> lecternHit = lecternFor(pearl);
         if (lecternHit.isPresent()) {
-            loadPearlViaLectern(pearl, requesterName, lecternHit.get());
-            return;
+            return loadPearlViaLectern(pearl, requesterName, lecternHit.get(), request.mode());
+        }
+
+        if (request.mode() == PearlLoadMode.INSTANT) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Queue Instant Pearl")
+                    .description("Instant pearl requires a lectern chamber mapping with a pull button.")
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
+            return false;
         }
 
         if (!PLUGIN_CONFIG.autoLoad.allowTrapdoorFallback) {
@@ -1022,7 +1118,7 @@ public class PearlManager {
                             + ". Physical trapdoor fallback is disabled.")
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
 
         acquireKillAuraSuppression();
@@ -1055,7 +1151,7 @@ public class PearlManager {
                     .title("Loading Pearl")
                     .addField("Pearl", pearl.pearlId, false)
                     .primaryColor());
-            return;
+            return true;
         }
 
         int trapX = (int) trapdoorPos.x();
@@ -1101,7 +1197,7 @@ public class PearlManager {
                     .title("Loading Pearl")
                     .addField("Pearl", pearl.pearlId, false)
                     .primaryColor());
-            return;
+            return true;
         }
 
         // path to the walkable block and right-click the trapdoor
@@ -1115,18 +1211,20 @@ public class PearlManager {
                 .title("Loading Pearl")
                 .addField("Pearl", pearl.pearlId, false)
                 .primaryColor());
+        return true;
     }
 
-    private void loadPearlViaLectern(final PearlPlusConfig.StoredPearl pearl,
-                                     final String requesterName,
-                                     final ChamberLookup.Hit hit) {
+    private boolean loadPearlViaLectern(final PearlPlusConfig.StoredPearl pearl,
+                                        final String requesterName,
+                                        final ChamberLookup.Hit hit,
+                                        final PearlLoadMode mode) {
         if (!hasConfiguredHome()) {
             notifier.discordAndIngameNotification(Embed.builder()
                     .title("Can't Load Pearl")
                     .description("Home is not configured; lectern chambers need home coordinates")
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
 
         int[] lecternRel = ChamberLookup.parseCoord(hit.lectern());
@@ -1136,7 +1234,7 @@ public class PearlManager {
                     .description("Malformed lectern coordinate in chambers.json: " + hit.lectern())
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
 
         int homeBlockX = (int) Math.floor(PLUGIN_CONFIG.autoLoad.home.x);
@@ -1151,14 +1249,23 @@ public class PearlManager {
                     .description("No lectern found at " + lecternX + "," + lecternZ)
                     .errorColor());
             resumeScannerAfterPearlLoad();
-            return;
+            return false;
         }
 
         int[] buttonWorld = resolveButtonWorld(hit, homeBlockX, homeBlockZ, pearl.y);
         int buttonId = 100 + (hit.page() - 1);
+        if (mode == PearlLoadMode.INSTANT && buttonWorld == null) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Queue Instant Pearl")
+                    .description("Instant lectern pearls need a mapped pull button so the page can be staged safely.")
+                    .errorColor());
+            resumeScannerAfterPearlLoad();
+            return false;
+        }
 
         acquireKillAuraSuppression();
-        beginAction("load pearl " + pearl.pearlId + " via lectern");
+        beginAction((mode == PearlLoadMode.INSTANT ? "instant pearl " : "load pearl ")
+                + pearl.pearlId + " via lectern");
 
         if (PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad) {
             ensurePearlsAvailable();
@@ -1182,13 +1289,14 @@ public class PearlManager {
         notifier.discordAndIngameNotification(buildLecternLoadingEmbed(pearl, hit));
 
         if (isWithinBlockInteractRange(lecternX, lecternY, lecternZ)) {
-            rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld);
-            return;
+            rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld, mode);
+            return true;
         }
 
         BARITONE.pathTo(pathX, pathY, pathZ)
                 .addExecutedListener(future ->
-                        rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld));
+                        rightClickLecternAndFlip(pearl, requesterName, startPos, lecternX, lecternY, lecternZ, buttonId, buttonWorld, mode));
+        return true;
     }
 
     private int[] resolveButtonWorld(final ChamberLookup.Hit hit,
@@ -1278,10 +1386,11 @@ public class PearlManager {
                                           final int lecternY,
                                           final int lecternZ,
                                           final int buttonId,
-                                          final int[] buttonWorld) {
+                                          final int[] buttonWorld,
+                                          final PearlLoadMode mode) {
         BARITONE.rightClickBlock(lecternX, lecternY, lecternZ)
                 .addExecutedListener(f ->
-                        pendingLecternFlow = new LecternFlow(pearl, requesterName, startPos, buttonId, buttonWorld));
+                        pendingLecternFlow = new LecternFlow(pearl, requesterName, startPos, buttonId, buttonWorld, mode));
     }
 
     private void advanceLecternFlow() {
@@ -1326,20 +1435,74 @@ public class PearlManager {
             return;
         }
 
-        boolean inventoryDone = flow.inventoryFuture != null && flow.inventoryFuture.isDone();
-        boolean closeConfirmed = inventoryDone && openContainer == 0;
-        if (closeConfirmed || flow.ticksInPhase >= LECTERN_CLOSE_MAX_TICKS) {
-            if (!closeConfirmed) {
-                info("Lectern close not confirmed after " + flow.ticksInPhase + " ticks; clicking pull button anyway");
+        if (flow.phase == LecternPhase.WAITING_FOR_CLOSE) {
+            boolean inventoryDone = flow.inventoryFuture != null && flow.inventoryFuture.isDone();
+            boolean closeConfirmed = inventoryDone && openContainer == 0;
+            if (closeConfirmed || flow.ticksInPhase >= LECTERN_CLOSE_MAX_TICKS) {
+                if (!closeConfirmed) {
+                    info("Lectern close not confirmed after " + flow.ticksInPhase + " ticks; clicking pull button anyway");
+                }
+                if (flow.mode == PearlLoadMode.INSTANT) {
+                    flow.phase = LecternPhase.WAITING_FOR_TARGET_ONLINE;
+                    flow.ticksInPhase = 0;
+                    notifier.discordAndIngameNotification(Embed.builder()
+                            .title("Instant Pearl Staged")
+                            .description("Waiting up to 120 seconds for " + flow.requesterName + " to appear in tab.")
+                            .addField("Pearl", flow.pearl.pearlId == null ? "unknown" : flow.pearl.pearlId, false)
+                            .primaryColor());
+                    return;
+                }
+                int[] button = flow.buttonWorld;
+                PearlPlusConfig.StoredPearl pearl = flow.pearl;
+                String requesterName = flow.requesterName;
+                BlockPos startPos = flow.startPos;
+                pendingLecternFlow = null;
+                info("Right-clicking pull button at [" + button[0] + ", " + button[1] + ", " + button[2] + "]");
+                BARITONE.rightClickBlock(button[0], button[1], button[2])
+                        .addExecutedListener(f -> finishPearlLoad(pearl, requesterName, startPos));
             }
-            int[] button = flow.buttonWorld;
-            PearlPlusConfig.StoredPearl pearl = flow.pearl;
-            String requesterName = flow.requesterName;
-            BlockPos startPos = flow.startPos;
-            pendingLecternFlow = null;
-            info("Right-clicking pull button at [" + button[0] + ", " + button[1] + ", " + button[2] + "]");
-            BARITONE.rightClickBlock(button[0], button[1], button[2])
-                    .addExecutedListener(f -> finishPearlLoad(pearl, requesterName, startPos));
+            return;
+        }
+
+        if (flow.phase == LecternPhase.WAITING_FOR_TARGET_ONLINE) {
+            if (isPlayerOnline(flow.requesterName)) {
+                int[] button = flow.buttonWorld;
+                PearlPlusConfig.StoredPearl pearl = flow.pearl;
+                String requesterName = flow.requesterName;
+                BlockPos startPos = flow.startPos;
+                pendingLecternFlow = null;
+                info("Instant pearl target " + requesterName + " is online; clicking pull button at ["
+                        + button[0] + ", " + button[1] + ", " + button[2] + "]");
+                actionStartedAtMs = System.currentTimeMillis();
+                actionDescription = "instant pearl " + pearl.pearlId + " pull";
+                BARITONE.rightClickBlock(button[0], button[1], button[2])
+                        .addExecutedListener(f -> finishPearlLoad(pearl, requesterName, startPos));
+                return;
+            }
+            if (System.currentTimeMillis() >= flow.instantDeadlineMs) {
+                info("Instant pearl expired waiting for " + flow.requesterName + " to appear in tab");
+                notifier.discordAndIngameNotification(Embed.builder()
+                        .title("Instant Pearl Expired")
+                        .description(flow.requesterName + " did not appear in tab within 120 seconds.")
+                        .addField("Pearl", flow.pearl.pearlId == null ? "unknown" : flow.pearl.pearlId, false)
+                        .errorColor());
+                pendingLecternFlow = null;
+                actionStartedAtMs = System.currentTimeMillis();
+                actionDescription = "instant pearl " + flow.pearl.pearlId + " expired return";
+                returnAfterLoad(flow.startPos);
+            }
+        }
+    }
+
+    private boolean isPlayerOnline(final String playerName) {
+        if (playerName == null || playerName.isBlank() || CACHE == null || CACHE.getTabListCache() == null) {
+            return false;
+        }
+        try {
+            return CACHE.getTabListCache().getFromName(playerName).isPresent();
+        } catch (final Exception e) {
+            LOG.debug("Failed checking tab list for {}", playerName, e);
+            return false;
         }
     }
 
@@ -1363,16 +1526,17 @@ public class PearlManager {
             }
             return;
         }
-        if (actionInProgress && now - actionStartedAtMs >= ACTION_TIMEOUT_MS) {
+        if (actionInProgress && !isInstantPearlWaiting() && now - actionStartedAtMs >= ACTION_TIMEOUT_MS) {
             info("SyntaxPearl action timed out: " + actionDescription + ". Stopping Baritone and clearing action state");
             BARITONE.stop();
             pendingLecternFlow = null;
             completeAction();
         }
+        processPearlQueue();
         if (!PLUGIN_CONFIG.autoLoad.returnHomeEnabled || !hasConfiguredHome()) {
             return;
         }
-        if (resumeScannerAfterAction) {
+        if (resumeScannerAfterAction || queuedPearlLoadCount() > 0) {
             return;
         }
         if (actionInProgress || now - lastIdleHomeAttemptMs < IDLE_HOME_INTERVAL_MS) {
@@ -1399,6 +1563,12 @@ public class PearlManager {
         beginAction("idle return home");
         info("Idle recovery detected bot away from home, pathing back");
         pathToConfiguredHome(true);
+    }
+
+    private boolean isInstantPearlWaiting() {
+        return pendingLecternFlow != null
+                && pendingLecternFlow.mode == PearlLoadMode.INSTANT
+                && pendingLecternFlow.phase == LecternPhase.WAITING_FOR_TARGET_ONLINE;
     }
 
     public String pearlsList(UUID ownerUuid) {

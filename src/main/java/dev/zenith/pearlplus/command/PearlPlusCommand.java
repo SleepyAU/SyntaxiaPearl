@@ -42,6 +42,7 @@ public class PearlPlusCommand extends Command {
                 "del <playerName> <pearlId>",
                 "defaultpearlid <word|none>",
                 "load <playerName> [pearlId]",
+                "instant <playerName> [pearlId]",
                 "returnpos <on/off>",
                 "home <on/off>",
                 "home coords <x> <y> <z>",
@@ -150,10 +151,18 @@ public class PearlPlusCommand extends Command {
 
         builder.then(literal("load")
                 .then(argument("playerName", wordWithChars()).executes(c -> {
-                    return loadPearlByName(c, getString(c, "playerName"), null);
+                    return loadPearlByName(c, getString(c, "playerName"), null, false);
                 })
                         .then(argument("pearlId", wordWithChars()).executes(c -> {
-                            return loadPearlByName(c, getString(c, "playerName"), getString(c, "pearlId"));
+                            return loadPearlByName(c, getString(c, "playerName"), getString(c, "pearlId"), false);
+                        }))));
+
+        builder.then(literal("instant")
+                .then(argument("playerName", wordWithChars()).executes(c -> {
+                    return loadPearlByName(c, getString(c, "playerName"), null, true);
+                })
+                        .then(argument("pearlId", wordWithChars()).executes(c -> {
+                            return loadPearlByName(c, getString(c, "playerName"), getString(c, "pearlId"), true);
                         }))));
         
         builder.then(literal("defaultpearlid")
@@ -403,7 +412,8 @@ public class PearlPlusCommand extends Command {
 
     private int loadPearlByName(final com.mojang.brigadier.context.CommandContext<CommandContext> c,
                                 final String name,
-                                final String pearlId) {
+                                final String pearlId,
+                                final boolean instant) {
         UUID uuid = resolveUuidByUsername(name);
         if (uuid == null) {
             c.getSource().getEmbed().title("Invalid username: " + name);
@@ -425,8 +435,12 @@ public class PearlPlusCommand extends Command {
             return 0;
         }
 
-        manager.loadPearl(playerEntry.pearls.get(resolvedPearlId), name);
-        c.getSource().getEmbed().title("Loading pearl " + resolvedPearlId + " for " + name);
+        int queuePosition = instant
+                ? manager.instantPearl(playerEntry.pearls.get(resolvedPearlId), name)
+                : manager.loadPearl(playerEntry.pearls.get(resolvedPearlId), name);
+        c.getSource().getEmbed()
+                .title((instant ? "Instant pearl " : "Pearl ") + resolvedPearlId + " queued for " + name)
+                .description("Queue position: " + queuePosition);
         return 0;
     }
 

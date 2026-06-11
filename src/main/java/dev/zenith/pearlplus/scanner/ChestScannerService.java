@@ -78,6 +78,10 @@ public class ChestScannerService {
     private static final int CUSTOM_PATH_NEAR_RANGE_SQ = 2;
     private static final double CUSTOM_PATH_CENTER_DISTANCE_SQ = 0.16D;
     private static final double DROP_CENTER_DISTANCE_SQ = 0.04D;
+    private static final double DROP_STRICT_CENTER_DISTANCE_SQ = 0.01D;
+    private static final long DROP_WAIT_TIMEOUT_MS = 30_000L;
+    private static final long DROP_RECOVERY_DIRECT_MOVE_TIMEOUT_MS = 8_000L;
+    private static final long DROP_RECOVERY_WAIT_TIMEOUT_MS = 20_000L;
     private static final double CHEST_STAND_DIRECT_MOVE_MAX_DISTANCE_SQ = 64.0D;
     private static final long CHEST_STAND_DIRECT_MOVE_BASE_TIMEOUT_MS = 650L;
     private static final long CHEST_STAND_DIRECT_MOVE_PER_BLOCK_TIMEOUT_MS = 450L;
@@ -880,7 +884,16 @@ public class ChestScannerService {
         if (!directMoveToHorizontalTarget("scanner drop", markerX, markerZ, CUSTOM_PATH_DIRECT_MOVE_TIMEOUT_MS, DROP_CENTER_DISTANCE_SQ)) {
             return false;
         }
-        return waitForDropToMarker();
+        if (waitForDropToMarker(DROP_WAIT_TIMEOUT_MS)) {
+            return true;
+        }
+
+        PearlPlusPlugin.LOG.warn("Scanner drop did not start after initial center; trying strict drop recenter");
+        if (!directMoveToHorizontalTarget("scanner drop recovery", markerX, markerZ,
+            DROP_RECOVERY_DIRECT_MOVE_TIMEOUT_MS, DROP_STRICT_CENTER_DISTANCE_SQ)) {
+            return false;
+        }
+        return waitForDropToMarker(DROP_RECOVERY_WAIT_TIMEOUT_MS);
     }
 
     private Integer highestCustomPathY() {
@@ -894,15 +907,15 @@ public class ChestScannerService {
         return highestY;
     }
 
-    private boolean waitForDropToMarker() {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15L);
+    private boolean waitForDropToMarker(final long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
         while (operationActive() && System.currentTimeMillis() < deadline) {
             final boolean wasPaused = withdrawActive && withdrawPauseRequested && !markerReturnForPearlLoad;
             if (!waitIfWithdrawPaused()) {
                 break;
             }
             if (wasPaused) {
-                deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15L);
+                deadline = System.currentTimeMillis() + timeoutMs;
             }
             if (CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null) {
                 final double playerX = CACHE.getPlayerCache().getThePlayer().getX();
@@ -920,7 +933,17 @@ public class ChestScannerService {
 
         stopDirectMovement();
         if (operationActive()) {
-            PearlPlusPlugin.LOG.warn("Timed out waiting to drop to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ);
+            if (CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null) {
+                PearlPlusPlugin.LOG.warn("Timed out waiting to drop to scanner marker at [{}, {}, {}]; bot position [{}, {}, {}]",
+                    markerX,
+                    markerY,
+                    markerZ,
+                    CACHE.getPlayerCache().getThePlayer().getX(),
+                    CACHE.getPlayerCache().getThePlayer().getY(),
+                    CACHE.getPlayerCache().getThePlayer().getZ());
+            } else {
+                PearlPlusPlugin.LOG.warn("Timed out waiting to drop to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ);
+            }
         }
         return false;
     }
