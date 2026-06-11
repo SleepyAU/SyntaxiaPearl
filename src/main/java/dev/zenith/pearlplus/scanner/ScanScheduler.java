@@ -46,7 +46,7 @@ public class ScanScheduler {
             PearlPlusPlugin.LOG.warn("Scanner not enabled");
             return;
         }
-        if (scanner.isScanActive()) {
+        if (scanner.isScanActive() || scanner.isScanPaused()) {
             PearlPlusPlugin.LOG.warn("Scan already in progress");
             return;
         }
@@ -105,6 +105,10 @@ public class ScanScheduler {
         int[] marker = parseMarkerPos();
         if (marker == null) {
             PearlPlusPlugin.LOG.error("Invalid marker position in config");
+            return;
+        }
+        if (scanner.isScanActive() || scanner.isScanPaused()) {
+            PearlPlusPlugin.LOG.info("Skipping automatic chest scan because scanner or withdrawal work is already active");
             return;
         }
 

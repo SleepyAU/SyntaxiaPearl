@@ -78,7 +78,11 @@ public class ChestScannerService {
     private static final int CUSTOM_PATH_NEAR_RANGE_SQ = 2;
     private static final double CUSTOM_PATH_CENTER_DISTANCE_SQ = 0.16D;
     private static final double DROP_CENTER_DISTANCE_SQ = 0.04D;
-    private static final long CONTAINER_OPEN_TIMEOUT_MS = 4_000L;
+    private static final double CHEST_STAND_DIRECT_MOVE_MAX_DISTANCE_SQ = 64.0D;
+    private static final long CHEST_STAND_DIRECT_MOVE_BASE_TIMEOUT_MS = 650L;
+    private static final long CHEST_STAND_DIRECT_MOVE_PER_BLOCK_TIMEOUT_MS = 450L;
+    private static final long CONTAINER_OPEN_TIMEOUT_MS = 750L;
+    private static final long CONTAINER_LATE_OPEN_CLOSE_GRACE_MS = 300L;
     private static final long CONTAINER_CLOSE_TIMEOUT_MS = 2_000L;
     private static final long CONTAINER_POLL_MS = 10L;
     private static final long WITHDRAW_BATCH_SETTLE_MS = 250L;
@@ -99,6 +103,10 @@ public class ChestScannerService {
 
     private volatile boolean scanActive = false;
     private volatile boolean withdrawActive = false;
+    private volatile boolean markerReturnActive = false;
+    private volatile boolean markerReturnForPearlLoad = false;
+    private volatile boolean withdrawPauseRequested = false;
+    private volatile boolean withdrawPausedForPearl = false;
     private volatile boolean pauseRequested = false;
     private volatile boolean cancelRequested = false;
     private volatile boolean discoveryComplete = false;
@@ -108,6 +116,7 @@ public class ChestScannerService {
     private final Set<String> scannedThisScan = new HashSet<>();
     private final Set<String> readChestKeys = new HashSet<>();
     private final List<String> pendingChestKeys = new ArrayList<>();
+    private final Object withdrawPauseMonitor = new Object();
 
     // Local mapping: chestKey -> ChestLocationData (never sent to API)
     private final Map<String, ChestLocationData> localChestLocations = new LinkedHashMap<>();
@@ -123,9 +132,41 @@ public class ChestScannerService {
                                   String itemId,
                                   int shulkerCount,
                                   String requesterName,
-                                  List<String> candidateChestIds) { }
+                                  List<String> candidateChestIds,
+                                  List<WithdrawItem> items) {
+        public WithdrawRequest {
+            candidateChestIds = candidateChestIds == null ? List.of() : List.copyOf(candidateChestIds);
+            if (items == null || items.isEmpty()) {
+                items = itemId == null || itemId.isBlank() || shulkerCount <= 0
+                    ? List.of()
+                    : List.of(new WithdrawItem(itemId, shulkerCount, candidateChestIds));
+            } else {
+                items = List.copyOf(items);
+            }
+        }
+
+        public WithdrawRequest(final String requestId,
+                               final String itemId,
+                               final int shulkerCount,
+                               final String requesterName,
+                               final List<String> candidateChestIds) {
+            this(requestId, itemId, shulkerCount, requesterName, candidateChestIds, List.of());
+        }
+
+        public int totalShulkerCount() {
+            return items.stream().mapToInt(WithdrawItem::shulkerCount).sum();
+        }
+    }
+
+    public record WithdrawItem(String itemId, int shulkerCount, List<String> candidateChestIds) {
+        public WithdrawItem {
+            candidateChestIds = candidateChestIds == null ? List.of() : List.copyOf(candidateChestIds);
+        }
+    }
 
     private record OpenedChest(Container container, int topSlots) { }
+
+    private record DepositResult(int deposited, boolean exhausted) { }
 
     private static final class ChestLocationData {
         final int x;
@@ -183,8 +224,8 @@ public class ChestScannerService {
     }
 
     public synchronized void startScan(final int markerX, final int markerY, final int markerZ) {
-        if (scanActive) {
-            PearlPlusPlugin.LOG.warn("Scan already in progress");
+        if (busyForNewWork()) {
+            PearlPlusPlugin.LOG.warn("Cannot start scan while scanner, withdrawal, or pearl-load return is active");
             return;
         }
         resetScanState();
@@ -229,8 +270,37 @@ public class ChestScannerService {
         return true;
     }
 
+    public boolean returnPausedScannerToMarkerForPearlLoad() {
+        if (!pauseRequested && !withdrawPauseRequested && !withdrawPausedForPearl) {
+            return false;
+        }
+
+        final int[] marker = parseConfiguredMarkerPos();
+        if (marker == null) {
+            return false;
+        }
+
+        this.markerX = marker[0];
+        this.markerY = marker[1];
+        this.markerZ = marker[2];
+        markerReturnActive = true;
+        markerReturnForPearlLoad = true;
+        createScanLock();
+        try {
+            PearlPlusPlugin.LOG.info("Returning to scanner marker before pearl load");
+            final boolean returned = returnToMarkerAfterScan();
+            closeOpenContainerIfPresentSafely();
+            return returned;
+        } finally {
+            markerReturnForPearlLoad = false;
+            markerReturnActive = false;
+            BARITONE.stop();
+            clearScanLock();
+        }
+    }
+
     public synchronized boolean clearRemoteStashData() {
-        if (scanActive || hasPausedScan()) {
+        if (busyForNewWork()) {
             return false;
         }
 
@@ -498,6 +568,9 @@ public class ChestScannerService {
         PearlPlusPlugin.LOG.info("Following custom scanner path with {} waypoints", path.size());
         for (int i = 0; i < path.size(); i++) {
             final CustomPathPoint point = path.get(i);
+            if (!waitIfWithdrawPaused()) {
+                return false;
+            }
             if (!operationActive()) {
                 return false;
             }
@@ -523,11 +596,19 @@ public class ChestScannerService {
             PearlPlusPlugin.LOG.info("Pathing to custom scanner waypoint {}: [{}, {}, {}]", point.index(), x, y, z);
             try {
                 final boolean reached = BARITONE.pathTo(x, y, z).get(CUSTOM_PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (!reached && waitIfWithdrawPausedAndRetry()) {
+                    i--;
+                    continue;
+                }
                 if (!reached && operationActive()) {
                     PearlPlusPlugin.LOG.warn("Failed to reach custom scanner waypoint {} at [{}, {}, {}]", point.index(), x, y, z);
                     return false;
                 }
             } catch (final Exception e) {
+                if (waitIfWithdrawPausedAndRetry()) {
+                    i--;
+                    continue;
+                }
                 if (operationActive()) {
                     PearlPlusPlugin.LOG.warn("Error pathing to custom scanner waypoint {}", point.index(), e);
                 }
@@ -557,18 +638,32 @@ public class ChestScannerService {
         }
 
         PearlPlusPlugin.LOG.info("Pathing near column entry waypoint {}: [{}, {}, {}]", point.index(), x, y, z);
-        try {
-            final boolean reachedNear = BARITONE.pathTo(new GoalNear(x, y, z, CUSTOM_PATH_NEAR_RANGE_SQ))
-                .get(CUSTOM_PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!reachedNear && operationActive()) {
-                PearlPlusPlugin.LOG.warn("Failed to path near column entry waypoint {} at [{}, {}, {}]", point.index(), x, y, z);
+        while (operationActive()) {
+            if (!waitIfWithdrawPaused()) {
                 return false;
             }
-        } catch (final Exception e) {
-            if (operationActive()) {
-                PearlPlusPlugin.LOG.warn("Error pathing near column entry waypoint {}", point.index(), e);
+            try {
+                final boolean reachedNear = BARITONE.pathTo(new GoalNear(x, y, z, CUSTOM_PATH_NEAR_RANGE_SQ))
+                    .get(CUSTOM_PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (reachedNear) {
+                    break;
+                }
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Failed to path near column entry waypoint {} at [{}, {}, {}]", point.index(), x, y, z);
+                    return false;
+                }
+            } catch (final Exception e) {
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Error pathing near column entry waypoint {}", point.index(), e);
+                }
+                return false;
             }
-            return false;
         }
 
         return directMoveIntoColumn(point, x, z);
@@ -587,8 +682,15 @@ public class ChestScannerService {
         PearlPlusPlugin.LOG.info("Walking to {} at [{}, {}]", label, targetX, targetZ);
         BARITONE.stop();
 
-        final long deadline = System.currentTimeMillis() + timeoutMs;
+        long deadline = System.currentTimeMillis() + timeoutMs;
         while (operationActive() && System.currentTimeMillis() < deadline) {
+            final boolean wasPaused = withdrawActive && withdrawPauseRequested && !markerReturnForPearlLoad;
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            if (wasPaused) {
+                deadline = System.currentTimeMillis() + timeoutMs;
+            }
             if (isInsideHorizontalTarget(targetX, targetZ, centerDistanceSq)) {
                 stopDirectMovement();
                 return true;
@@ -668,8 +770,15 @@ public class ChestScannerService {
 
     private boolean rideVerticalColumnTo(final CustomPathPoint point, final int x, final int y, final int z) {
         PearlPlusPlugin.LOG.info("Riding vertical column to custom scanner waypoint {}: [{}, {}, {}]", point.index(), x, y, z);
-        final long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(CUSTOM_PATH_TIMEOUT_SECONDS);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(CUSTOM_PATH_TIMEOUT_SECONDS);
         while (operationActive() && System.currentTimeMillis() < deadline) {
+            final boolean wasPaused = withdrawActive && withdrawPauseRequested && !markerReturnForPearlLoad;
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            if (wasPaused) {
+                deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(CUSTOM_PATH_TIMEOUT_SECONDS);
+            }
             if (CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null) {
                 final double playerY = CACHE.getPlayerCache().getThePlayer().getY();
                 if (playerY >= point.y() - 0.25D) {
@@ -693,19 +802,34 @@ public class ChestScannerService {
             return true;
         }
 
-        try {
-            final boolean reached = BARITONE.pathTo(markerX, markerY, markerZ)
-                .get(PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!reached && operationActive()) {
-                PearlPlusPlugin.LOG.warn("Failed to return to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ);
+        while (operationActive()) {
+            if (!waitIfWithdrawPaused()) {
+                return false;
             }
-            return reached;
-        } catch (final Exception e) {
-            if (operationActive()) {
-                PearlPlusPlugin.LOG.warn("Error returning to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ, e);
+            try {
+                final boolean reached = BARITONE.pathTo(markerX, markerY, markerZ)
+                    .get(PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (reached) {
+                    return true;
+                }
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Failed to return to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ);
+                }
+                return false;
+            } catch (final Exception e) {
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Error returning to scanner marker at [{}, {}, {}]", markerX, markerY, markerZ, e);
+                }
+                return false;
             }
-            return false;
         }
+        return false;
     }
 
     private boolean tryCustomDropReturnToMarker() {
@@ -725,18 +849,32 @@ public class ChestScannerService {
         }
 
         PearlPlusPlugin.LOG.info("Returning through custom scanner drop at [{}, {}, {}]", markerX, upperY, markerZ);
-        try {
-            final boolean reachedNear = BARITONE.pathTo(new GoalNear(markerX, upperY, markerZ, CUSTOM_PATH_NEAR_RANGE_SQ))
-                .get(CUSTOM_PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!reachedNear && operationActive()) {
-                PearlPlusPlugin.LOG.warn("Failed to path near scanner drop at [{}, {}, {}]", markerX, upperY, markerZ);
+        while (operationActive()) {
+            if (!waitIfWithdrawPaused()) {
                 return false;
             }
-        } catch (final Exception e) {
-            if (operationActive()) {
-                PearlPlusPlugin.LOG.warn("Error pathing near scanner drop at [{}, {}, {}]", markerX, upperY, markerZ, e);
+            try {
+                final boolean reachedNear = BARITONE.pathTo(new GoalNear(markerX, upperY, markerZ, CUSTOM_PATH_NEAR_RANGE_SQ))
+                    .get(CUSTOM_PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (reachedNear) {
+                    break;
+                }
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Failed to path near scanner drop at [{}, {}, {}]", markerX, upperY, markerZ);
+                    return false;
+                }
+            } catch (final Exception e) {
+                if (waitIfWithdrawPausedAndRetry()) {
+                    continue;
+                }
+                if (operationActive()) {
+                    PearlPlusPlugin.LOG.warn("Error pathing near scanner drop at [{}, {}, {}]", markerX, upperY, markerZ, e);
+                }
+                return false;
             }
-            return false;
         }
 
         if (!directMoveToHorizontalTarget("scanner drop", markerX, markerZ, CUSTOM_PATH_DIRECT_MOVE_TIMEOUT_MS, DROP_CENTER_DISTANCE_SQ)) {
@@ -757,8 +895,15 @@ public class ChestScannerService {
     }
 
     private boolean waitForDropToMarker() {
-        final long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15L);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15L);
         while (operationActive() && System.currentTimeMillis() < deadline) {
+            final boolean wasPaused = withdrawActive && withdrawPauseRequested && !markerReturnForPearlLoad;
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            if (wasPaused) {
+                deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15L);
+            }
             if (CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null) {
                 final double playerX = CACHE.getPlayerCache().getThePlayer().getX();
                 final double playerY = CACHE.getPlayerCache().getThePlayer().getY();
@@ -799,7 +944,57 @@ public class ChestScannerService {
     private record CustomPathPoint(int index, double x, double y, double z) { }
 
     private boolean operationActive() {
-        return scanActive || withdrawActive;
+        return scanActive || withdrawActive || markerReturnActive;
+    }
+
+    private boolean busyForNewWork() {
+        return scanActive
+            || withdrawActive
+            || markerReturnActive
+            || pauseRequested
+            || withdrawPauseRequested
+            || withdrawPausedForPearl;
+    }
+
+    private boolean waitIfWithdrawPaused() {
+        if (markerReturnForPearlLoad) {
+            return operationActive();
+        }
+        if (!withdrawActive || !withdrawPauseRequested) {
+            return operationActive();
+        }
+
+        BARITONE.stop();
+        stopDirectMovement();
+        closeOpenContainerIfPresentSafely();
+        clearScanLock();
+
+        synchronized (withdrawPauseMonitor) {
+            if (!withdrawPausedForPearl) {
+                PearlPlusPlugin.LOG.info("Withdrawal paused for pearl load request");
+            }
+            withdrawPausedForPearl = true;
+            withdrawPauseMonitor.notifyAll();
+            while (withdrawActive && withdrawPauseRequested) {
+                try {
+                    withdrawPauseMonitor.wait(250L);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            withdrawPausedForPearl = false;
+        }
+
+        if (withdrawActive) {
+            createScanLock();
+            PearlPlusPlugin.LOG.info("Resuming withdrawal after pearl load");
+        }
+        return operationActive();
+    }
+
+    private boolean waitIfWithdrawPausedAndRetry() {
+        return !markerReturnForPearlLoad && withdrawActive && withdrawPauseRequested && waitIfWithdrawPaused();
     }
 
     private void readChestContents() {
@@ -1136,8 +1331,32 @@ public class ChestScannerService {
         if (!isPlayerInInteractRange(chestBlocks)) {
             boolean pathAccepted = false;
             int[] chosenStandPos = null;
-            for (final int[] candidate : standPositions) {
-                if (BARITONE.pathTo(candidate[0], candidate[1], candidate[2]).get(PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            for (int i = 0; i < standPositions.size(); i++) {
+                final int[] candidate = standPositions.get(i);
+                if (!waitIfWithdrawPaused()) {
+                    return null;
+                }
+                if (tryDirectMoveToNearbyStandPosition(candidate, chestKey)) {
+                    pathAccepted = true;
+                    chosenStandPos = candidate;
+                    break;
+                }
+
+                final boolean reached;
+                try {
+                    reached = BARITONE.pathTo(candidate[0], candidate[1], candidate[2]).get(PATH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (final Exception e) {
+                    if (waitIfWithdrawPausedAndRetry()) {
+                        i--;
+                        continue;
+                    }
+                    throw e;
+                }
+                if (!reached && waitIfWithdrawPausedAndRetry()) {
+                    i--;
+                    continue;
+                }
+                if (reached) {
                     pathAccepted = true;
                     chosenStandPos = candidate;
                     break;
@@ -1152,13 +1371,12 @@ public class ChestScannerService {
             PearlPlusPlugin.LOG.debug("Using stand position [{}, {}, {}] for chest {}", chosenStandPos[0], chosenStandPos[1], chosenStandPos[2], chestKey);
         }
 
-        if (!openChestDirectly(chestBlocks, interactTarget)) {
-            PearlPlusPlugin.LOG.warn("Direct chest interaction failed for {}", chestKey);
+        if (!waitIfWithdrawPaused()) {
             return null;
         }
-
-        final Container container = waitForOpenContainer(CONTAINER_OPEN_TIMEOUT_MS);
+        final Container container = openChestContainerWithFallbacks(chestKey, chestBlocks, interactTarget);
         if (container == null) {
+            closeLateOpeningContainer(chestKey);
             PearlPlusPlugin.LOG.warn("Timed out waiting for chest container to open: {}", chestKey);
             return null;
         }
@@ -1172,6 +1390,83 @@ public class ChestScannerService {
         }
 
         return new OpenedChest(container, topSlots);
+    }
+
+    private Container openChestContainerWithFallbacks(final String chestKey,
+                                                      final int[][] chestBlocks,
+                                                      final int[] preferredTarget) {
+        boolean sentAnyInteraction = false;
+        for (final int[] target : orderedInteractTargets(chestBlocks, preferredTarget)) {
+            if (!waitIfWithdrawPaused()) {
+                return null;
+            }
+            if (!tryOpenChestBlock(target)) {
+                continue;
+            }
+            sentAnyInteraction = true;
+
+            final Container container = waitForOpenContainer(CONTAINER_OPEN_TIMEOUT_MS);
+            if (container != null) {
+                return container;
+            }
+
+            PearlPlusPlugin.LOG.debug("No container opened for {} via half [{}, {}, {}], trying fallback",
+                chestKey, target[0], target[1], target[2]);
+            closeOpenContainerIfPresent();
+        }
+
+        if (!sentAnyInteraction) {
+            PearlPlusPlugin.LOG.warn("Direct chest interaction failed for {}", chestKey);
+        }
+        return null;
+    }
+
+    private List<int[]> orderedInteractTargets(final int[][] chestBlocks, final int[] preferredTarget) {
+        final List<int[]> targets = new ArrayList<>();
+        if (preferredTarget != null) {
+            targets.add(preferredTarget);
+        }
+        for (final int[] chestBlock : chestBlocks) {
+            if (chestBlock == preferredTarget) {
+                continue;
+            }
+            targets.add(chestBlock);
+        }
+        return targets;
+    }
+
+    private boolean tryDirectMoveToNearbyStandPosition(final int[] candidate, final String chestKey) {
+        if (candidate == null
+            || CACHE == null
+            || CACHE.getPlayerCache() == null
+            || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+
+        final int feetY = (int) Math.floor(CACHE.getPlayerCache().getThePlayer().getY());
+        if (candidate[1] != feetY) {
+            return false;
+        }
+
+        final double dx = (candidate[0] + 0.5D) - CACHE.getPlayerCache().getThePlayer().getX();
+        final double dz = (candidate[2] + 0.5D) - CACHE.getPlayerCache().getThePlayer().getZ();
+        final double distanceSq = dx * dx + dz * dz;
+        if (distanceSq > CHEST_STAND_DIRECT_MOVE_MAX_DISTANCE_SQ) {
+            return false;
+        }
+
+        final long timeoutMs = Math.min(
+            CUSTOM_PATH_DIRECT_MOVE_TIMEOUT_MS,
+            CHEST_STAND_DIRECT_MOVE_BASE_TIMEOUT_MS
+                + (long) Math.ceil(Math.sqrt(distanceSq) * CHEST_STAND_DIRECT_MOVE_PER_BLOCK_TIMEOUT_MS)
+        );
+        return directMoveToHorizontalTarget(
+            "nearby chest stand position for " + chestKey,
+            candidate[0],
+            candidate[2],
+            timeoutMs,
+            CUSTOM_PATH_CENTER_DISTANCE_SQ
+        );
     }
 
     private ChestData openAndReadChest(final String chestKey, final ChestLocationData location) throws Exception {
@@ -1210,8 +1505,15 @@ public class ChestScannerService {
     }
 
     private Container waitForOpenContainer(final long timeoutMs) {
-        final long deadline = System.currentTimeMillis() + timeoutMs;
+        long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline && operationActive()) {
+            final boolean wasPaused = withdrawActive && withdrawPauseRequested && !markerReturnForPearlLoad;
+            if (!waitIfWithdrawPaused()) {
+                return null;
+            }
+            if (wasPaused) {
+                deadline = System.currentTimeMillis() + timeoutMs;
+            }
             final var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
             final int openContainerId = inventoryCache.getOpenContainerId();
             if (openContainerId != 0) {
@@ -1223,6 +1525,19 @@ public class ChestScannerService {
             sleepSilently(CONTAINER_POLL_MS);
         }
         return null;
+    }
+
+    private void closeLateOpeningContainer(final String chestKey) {
+        final long deadline = System.currentTimeMillis() + CONTAINER_LATE_OPEN_CLOSE_GRACE_MS;
+        while (System.currentTimeMillis() < deadline) {
+            final int openContainerId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+            if (openContainerId != 0) {
+                PearlPlusPlugin.LOG.debug("Closing late-opening container {} after timeout for {}", openContainerId, chestKey);
+                closeContainer(openContainerId);
+                return;
+            }
+            sleepSilently(CONTAINER_POLL_MS);
+        }
     }
 
     private void closeOpenContainerIfPresent() {
@@ -1284,6 +1599,7 @@ public class ChestScannerService {
         final boolean cancelled = cancelRequested;
         scanActive = false;
         BARITONE.stop();
+        closeOpenContainerIfPresentSafely();
         clearScanLock();
 
         if (paused) {
@@ -1323,7 +1639,7 @@ public class ChestScannerService {
     }
 
     private void pollWithdrawQueue() {
-        if (!PearlPlusPlugin.PLUGIN_CONFIG.scanner.enabled || scanActive || withdrawActive || hasPausedScan()) {
+        if (!PearlPlusPlugin.PLUGIN_CONFIG.scanner.enabled || busyForNewWork()) {
             return;
         }
         if (CACHE == null || CACHE.getPlayerCache() == null || CACHE.getPlayerCache().getThePlayer() == null) {
@@ -1335,17 +1651,22 @@ public class ChestScannerService {
             return;
         }
 
-        PearlPlusPlugin.LOG.info("Claimed withdraw request {}: {} shulker(s) of {} for {} ({} indexed candidate chest(s))",
-            request.requestId(), request.shulkerCount(), request.itemId(), request.requesterName(), request.candidateChestIds().size());
+        PearlPlusPlugin.LOG.info("Claimed withdraw request {}: {} for {} ({} indexed candidate chest(s))",
+            request.requestId(), withdrawSummary(request), request.requesterName(), request.candidateChestIds().size());
         try {
             fulfillWithdrawRequest(request);
             updateWithdrawRequestStatus(request.requestId(), "FULFILLED", null,
-                "Moved " + request.shulkerCount() + " shulker(s) of " + request.itemId() + " into withdrawal storage.");
+                "Moved " + withdrawSummary(request) + " into withdrawal storage.");
         } catch (final Exception e) {
             PearlPlusPlugin.LOG.error("Withdraw request {} failed", request.requestId(), e);
             updateWithdrawRequestStatus(request.requestId(), "FAILED", e.getMessage(), null);
         } finally {
             withdrawActive = false;
+            withdrawPauseRequested = false;
+            synchronized (withdrawPauseMonitor) {
+                withdrawPausedForPearl = false;
+                withdrawPauseMonitor.notifyAll();
+            }
             BARITONE.stop();
             clearScanLock();
         }
@@ -1364,43 +1685,93 @@ public class ChestScannerService {
                 return null;
             }
             final JsonObject request = requestElement.getAsJsonObject();
-            final List<String> candidateChestIds = new ArrayList<>();
-            final JsonArray candidateIds = request.has("candidateChestIds") && request.get("candidateChestIds").isJsonArray()
-                ? request.getAsJsonArray("candidateChestIds")
-                : null;
-            if (candidateIds != null) {
-                for (final JsonElement candidateId : candidateIds) {
-                    if (candidateId != null && !candidateId.isJsonNull()) {
-                        candidateChestIds.add(candidateId.getAsString());
-                    }
-                }
-            }
-            if (candidateChestIds.isEmpty()
-                && request.has("candidateChests")
-                && request.get("candidateChests").isJsonArray()) {
-                for (final JsonElement candidateElement : request.getAsJsonArray("candidateChests")) {
-                    if (candidateElement == null || !candidateElement.isJsonObject()) {
-                        continue;
-                    }
-                    final JsonObject candidate = candidateElement.getAsJsonObject();
-                    if (candidate.has("chestId") && !candidate.get("chestId").isJsonNull()) {
-                        candidateChestIds.add(candidate.get("chestId").getAsString());
-                    }
-                }
-            }
+            final List<String> candidateChestIds = parseCandidateChestIds(request);
+            final List<WithdrawItem> items = parseWithdrawItems(request, candidateChestIds);
+            final int shulkerCount = request.has("shulkerCount") && !request.get("shulkerCount").isJsonNull()
+                ? request.get("shulkerCount").getAsInt()
+                : items.stream().mapToInt(WithdrawItem::shulkerCount).sum();
             return new WithdrawRequest(
                 request.get("requestId").getAsString(),
-                request.get("itemId").getAsString(),
-                request.get("shulkerCount").getAsInt(),
+                request.has("itemId") && !request.get("itemId").isJsonNull()
+                    ? request.get("itemId").getAsString()
+                    : (items.isEmpty() ? "" : items.getFirst().itemId()),
+                shulkerCount,
                 request.has("requesterName") && !request.get("requesterName").isJsonNull()
                     ? request.get("requesterName").getAsString()
                     : "unknown",
-                List.copyOf(candidateChestIds)
+                candidateChestIds,
+                items
             );
         } catch (final Exception e) {
             PearlPlusPlugin.LOG.warn("Error claiming withdraw request", e);
             return null;
         }
+    }
+
+    private List<WithdrawItem> parseWithdrawItems(final JsonObject request, final List<String> fallbackCandidateChestIds) {
+        final List<WithdrawItem> items = new ArrayList<>();
+        if (request.has("items") && request.get("items").isJsonArray()) {
+            for (final JsonElement itemElement : request.getAsJsonArray("items")) {
+                if (itemElement == null || !itemElement.isJsonObject()) {
+                    continue;
+                }
+                final JsonObject item = itemElement.getAsJsonObject();
+                if (!item.has("itemId") || item.get("itemId").isJsonNull()
+                    || !item.has("shulkerCount") || item.get("shulkerCount").isJsonNull()) {
+                    continue;
+                }
+                final int shulkerCount = item.get("shulkerCount").getAsInt();
+                if (shulkerCount <= 0) {
+                    continue;
+                }
+                List<String> candidateChestIds = parseCandidateChestIds(item);
+                if (candidateChestIds.isEmpty()) {
+                    candidateChestIds = fallbackCandidateChestIds;
+                }
+                items.add(new WithdrawItem(item.get("itemId").getAsString(), shulkerCount, candidateChestIds));
+            }
+        }
+
+        if (!items.isEmpty()) {
+            return List.copyOf(items);
+        }
+        if (!request.has("itemId") || request.get("itemId").isJsonNull()
+            || !request.has("shulkerCount") || request.get("shulkerCount").isJsonNull()) {
+            return List.of();
+        }
+        final int shulkerCount = request.get("shulkerCount").getAsInt();
+        if (shulkerCount <= 0) {
+            return List.of();
+        }
+        return List.of(new WithdrawItem(request.get("itemId").getAsString(), shulkerCount, fallbackCandidateChestIds));
+    }
+
+    private List<String> parseCandidateChestIds(final JsonObject object) {
+        final List<String> candidateChestIds = new ArrayList<>();
+        final JsonArray candidateIds = object.has("candidateChestIds") && object.get("candidateChestIds").isJsonArray()
+            ? object.getAsJsonArray("candidateChestIds")
+            : null;
+        if (candidateIds != null) {
+            for (final JsonElement candidateId : candidateIds) {
+                if (candidateId != null && !candidateId.isJsonNull()) {
+                    candidateChestIds.add(candidateId.getAsString());
+                }
+            }
+        }
+        if (candidateChestIds.isEmpty()
+            && object.has("candidateChests")
+            && object.get("candidateChests").isJsonArray()) {
+            for (final JsonElement candidateElement : object.getAsJsonArray("candidateChests")) {
+                if (candidateElement == null || !candidateElement.isJsonObject()) {
+                    continue;
+                }
+                final JsonObject candidate = candidateElement.getAsJsonObject();
+                if (candidate.has("chestId") && !candidate.get("chestId").isJsonNull()) {
+                    candidateChestIds.add(candidate.get("chestId").getAsString());
+                }
+            }
+        }
+        return List.copyOf(candidateChestIds);
     }
 
     private void updateWithdrawRequestStatus(final String requestId,
@@ -1506,28 +1877,39 @@ public class ChestScannerService {
             throw new IllegalStateException("Failed to reach storage area for withdrawal");
         }
         ensureWithdrawLocations();
+        ensureIndexedStorageLocations(request);
 
-        int remaining = request.shulkerCount();
+        final Map<String, Integer> remaining = new LinkedHashMap<>();
+        for (final WithdrawItem item : request.items()) {
+            remaining.merge(item.itemId(), item.shulkerCount(), Integer::sum);
+        }
+        if (remaining.isEmpty()) {
+            throw new IllegalStateException("Withdrawal request did not include any item lines");
+        }
         int safetyPasses = 0;
-        while (remaining > 0 && operationActive() && safetyPasses++ < request.shulkerCount() + 10) {
-            int carried = countCarriedTargetShulkers(request.itemId());
-            if (carried <= 0) {
-                carried = takeTargetShulkersFromStorage(request, remaining);
+        final Set<String> exhaustedWithdrawalChests = new HashSet<>();
+        while (totalRemaining(remaining) > 0 && operationActive() && safetyPasses++ < request.totalShulkerCount() + 10) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            int carried = countCarriedRequestedShulkers(remaining);
+            final int collected = takeRequestedShulkersFromStorage(request, remaining);
+            if (collected > 0) {
+                carried = countCarriedRequestedShulkers(remaining);
             }
             if (carried <= 0) {
                 throw new IllegalStateException("No matching full shulker boxes found in indexed storage");
             }
 
-            final int deposited = depositTargetShulkersToWithdraw(request.itemId(), Math.min(remaining, carried));
+            final int deposited = depositRequestedShulkersToWithdraw(request, remaining, exhaustedWithdrawalChests);
             if (deposited <= 0) {
                 throw new IllegalStateException("No withdrawal chest space was reachable");
             }
-            remaining -= deposited;
-            PearlPlusPlugin.LOG.info("Withdraw request {} progress: {} remaining", request.requestId(), remaining);
+            PearlPlusPlugin.LOG.info("Withdraw request {} progress: {} shulker(s) remaining", request.requestId(), totalRemaining(remaining));
         }
 
-        if (remaining > 0) {
-            throw new IllegalStateException("Withdrawal stopped with " + remaining + " shulker(s) remaining");
+        if (totalRemaining(remaining) > 0) {
+            throw new IllegalStateException("Withdrawal stopped with " + totalRemaining(remaining) + " shulker(s) remaining");
         }
 
         returnToMarkerAfterScan();
@@ -1565,15 +1947,23 @@ public class ChestScannerService {
             .toList();
     }
 
-    private List<Map.Entry<String, ChestLocationData>> indexedStorageLocations(final WithdrawRequest request) {
+    private void ensureIndexedStorageLocations(final WithdrawRequest request) {
+        for (final WithdrawItem item : request.items()) {
+            if (indexedStorageLocations(item).isEmpty()) {
+                throw new IllegalStateException("No indexed storage chest candidates matched the local scanner map for " + item.itemId() + "; run stashscan scan");
+            }
+        }
+    }
+
+    private List<Map.Entry<String, ChestLocationData>> indexedStorageLocations(final WithdrawItem item) {
         final List<Map.Entry<String, ChestLocationData>> storage = storageLocations();
-        if (request.candidateChestIds() == null || request.candidateChestIds().isEmpty()) {
+        if (item.candidateChestIds() == null || item.candidateChestIds().isEmpty()) {
             return List.of();
         }
 
         final Map<String, Integer> candidateRank = new HashMap<>();
-        for (int i = 0; i < request.candidateChestIds().size(); i++) {
-            candidateRank.putIfAbsent(request.candidateChestIds().get(i), i);
+        for (int i = 0; i < item.candidateChestIds().size(); i++) {
+            candidateRank.putIfAbsent(item.candidateChestIds().get(i), i);
         }
 
         final List<Map.Entry<String, ChestLocationData>> matched = storage.stream()
@@ -1582,30 +1972,98 @@ public class ChestScannerService {
                 .comparingInt((Map.Entry<String, ChestLocationData> entry) -> candidateRank.get(apiChestId(entry.getKey())))
                 .thenComparingDouble(entry -> distanceSqToPlayer(entry.getValue().x, entry.getValue().y, entry.getValue().z)))
             .toList();
-        PearlPlusPlugin.LOG.info("Matched {} of {} indexed candidate chest IDs to local storage locations",
-            matched.size(), candidateRank.size());
+        PearlPlusPlugin.LOG.info("Matched {} of {} indexed candidate chest IDs to local storage locations for {}",
+            matched.size(), candidateRank.size(), item.itemId());
         return matched;
     }
 
-    private int takeTargetShulkersFromStorage(final WithdrawRequest request, final int maxCount) throws Exception {
+    private int takeRequestedShulkersFromStorage(final WithdrawRequest request,
+                                                 final Map<String, Integer> remaining) throws Exception {
         int moved = 0;
-        final List<Map.Entry<String, ChestLocationData>> storage = indexedStorageLocations(request);
+        for (final WithdrawItem item : request.items()) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            final int remainingForItem = remaining.getOrDefault(item.itemId(), 0);
+            if (remainingForItem <= 0) {
+                continue;
+            }
+            final int alreadyCarried = countCarriedTargetShulkers(item.itemId());
+            final int needed = remainingForItem - alreadyCarried;
+            if (needed <= 0) {
+                continue;
+            }
+            final int freeInventorySlots = Math.max(0, 36 - occupiedPlayerInventorySlots());
+            if (freeInventorySlots <= 0) {
+                if (moved > 0 || countCarriedRequestedShulkers(remaining) > 0) {
+                    break;
+                }
+                throw new IllegalStateException("No free player inventory slots for withdrawal");
+            }
+            moved += takeTargetShulkersFromStorage(item, Math.min(needed, freeInventorySlots));
+        }
+        return moved;
+    }
+
+    private int takeTargetShulkersFromStorage(final WithdrawItem item, final int maxCount) throws Exception {
+        int moved = 0;
+        final List<Map.Entry<String, ChestLocationData>> storage = indexedStorageLocations(item);
         if (storage.isEmpty()) {
-            throw new IllegalStateException("No indexed storage chest candidates matched the local scanner map; run stashscan scan");
+            throw new IllegalStateException("No indexed storage chest candidates matched the local scanner map for " + item.itemId() + "; run stashscan scan");
         }
         PearlPlusPlugin.LOG.info("Opening {} indexed candidate chest(s) for full shulker(s) of {}",
-            storage.size(), request.itemId());
+            storage.size(), item.itemId());
         for (final Map.Entry<String, ChestLocationData> entry : storage) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
             if (moved >= maxCount || !operationActive()) {
                 break;
             }
             final int freeInventorySlots = Math.max(0, 36 - occupiedPlayerInventorySlots());
             if (freeInventorySlots <= 0) {
+                if (moved > 0) {
+                    PearlPlusPlugin.LOG.info("Player inventory full after collecting {} shulker(s); depositing this batch before continuing", moved);
+                    break;
+                }
                 throw new IllegalStateException("No free player inventory slots for withdrawal");
             }
-            moved += takeTargetShulkersFromChest(entry.getKey(), entry.getValue(), request.itemId(), Math.min(maxCount - moved, freeInventorySlots));
+            moved += takeTargetShulkersFromChest(entry.getKey(), entry.getValue(), item.itemId(), Math.min(maxCount - moved, freeInventorySlots));
         }
         return moved;
+    }
+
+    private int depositRequestedShulkersToWithdraw(final WithdrawRequest request,
+                                                  final Map<String, Integer> remaining,
+                                                  final Set<String> exhaustedWithdrawalChests) throws Exception {
+        int depositedTotal = 0;
+        final Set<String> handledItems = new HashSet<>();
+        for (final WithdrawItem item : request.items()) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
+            if (!handledItems.add(item.itemId())) {
+                continue;
+            }
+            final int remainingForItem = remaining.getOrDefault(item.itemId(), 0);
+            if (remainingForItem <= 0) {
+                continue;
+            }
+            final int carried = countCarriedTargetShulkers(item.itemId());
+            if (carried <= 0) {
+                continue;
+            }
+            final int deposited = depositTargetShulkersToWithdraw(
+                item.itemId(),
+                Math.min(remainingForItem, carried),
+                exhaustedWithdrawalChests
+            );
+            if (deposited > 0) {
+                remaining.put(item.itemId(), Math.max(0, remainingForItem - deposited));
+                depositedTotal += deposited;
+            }
+        }
+        return depositedTotal;
     }
 
     private int takeTargetShulkersFromChest(final String chestKey,
@@ -1633,41 +2091,58 @@ public class ChestScannerService {
         return moved;
     }
 
-    private int depositTargetShulkersToWithdraw(final String itemId, final int maxCount) throws Exception {
+    private int depositTargetShulkersToWithdraw(final String itemId,
+                                               final int maxCount,
+                                               final Set<String> exhaustedWithdrawalChests) throws Exception {
         int deposited = 0;
         for (final Map.Entry<String, ChestLocationData> entry : withdrawalLocations()) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
             if (deposited >= maxCount || !operationActive()) {
                 break;
             }
-            deposited += depositTargetShulkersToChest(entry.getKey(), entry.getValue(), itemId, maxCount - deposited);
+            if (exhaustedWithdrawalChests.contains(entry.getKey())) {
+                continue;
+            }
+            final DepositResult result = depositTargetShulkersToChest(entry.getKey(), entry.getValue(), itemId, maxCount - deposited);
+            deposited += result.deposited();
+            if (result.exhausted()) {
+                exhaustedWithdrawalChests.add(entry.getKey());
+            }
         }
         return deposited;
     }
 
-    private int depositTargetShulkersToChest(final String chestKey,
-                                             final ChestLocationData location,
-                                             final String itemId,
-                                             final int maxCount) throws Exception {
+    private DepositResult depositTargetShulkersToChest(final String chestKey,
+                                                       final ChestLocationData location,
+                                                       final String itemId,
+                                                       final int maxCount) throws Exception {
         if (maxCount <= 0) {
-            return 0;
+            return new DepositResult(0, false);
         }
         final OpenedChest opened = openChestContainer(chestKey, location);
         if (opened == null) {
-            return 0;
+            return new DepositResult(0, false);
         }
 
         int deposited = 0;
+        boolean exhausted = false;
         try {
             final Container current = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
             if (current != null) {
                 final int emptySlots = countEmptyTopSlots(current, opened.topSlots());
-                final List<Integer> slots = bottomTargetShulkerSlots(current, opened.topSlots(), itemId, Math.min(maxCount, emptySlots));
+                if (emptySlots <= 0) {
+                    return new DepositResult(0, true);
+                }
+                final List<Integer> slots = carriedTargetContainerSlots(opened.topSlots(), itemId, Math.min(maxCount, emptySlots));
                 deposited = shiftClickSlots(current.getContainerId(), slots);
+                exhausted = deposited >= emptySlots;
             }
         } finally {
             closeContainer(opened.container().getContainerId());
         }
-        return deposited;
+        return new DepositResult(deposited, exhausted);
     }
 
     private int shiftClickSlots(final int containerId, final List<Integer> slots) throws Exception {
@@ -1677,6 +2152,9 @@ public class ChestScannerService {
 
         int submitted = 0;
         while (submitted < slots.size() && operationActive()) {
+            if (!waitIfWithdrawPaused()) {
+                break;
+            }
             final int batchSize = Math.min(WITHDRAW_CLICK_PACKET_LIMIT, slots.size() - submitted);
             if (!reserveWithdrawClickBudget(batchSize)) {
                 break;
@@ -1706,6 +2184,9 @@ public class ChestScannerService {
 
     private boolean reserveWithdrawClickBudget(final int packetCount) {
         while (operationActive()) {
+            if (!waitIfWithdrawPaused()) {
+                return false;
+            }
             long sleepMs = 0L;
             synchronized (withdrawClickPacketTimes) {
                 final long now = System.currentTimeMillis();
@@ -1768,6 +2249,26 @@ public class ChestScannerService {
         return slots;
     }
 
+    private List<Integer> carriedTargetContainerSlots(final int topSlots, final String itemId, final int maxCount) {
+        final List<Integer> slots = new ArrayList<>();
+        final var playerInventory = CACHE.getPlayerCache().getPlayerInventory();
+        if (playerInventory == null) {
+            return slots;
+        }
+        int count = 0;
+        for (int playerSlot = 9; playerSlot < Math.min(playerInventory.size(), 45); playerSlot++) {
+            final ItemStack stack = playerInventory.get(playerSlot);
+            if (isFullShulkerOfItem(stack, itemId)) {
+                slots.add(topSlots + (playerSlot - 9));
+                count += Math.max(1, stack.getAmount());
+                if (count >= maxCount) {
+                    break;
+                }
+            }
+        }
+        return slots;
+    }
+
     private int countEmptyTopSlots(final int topSlots) {
         final Container container = CACHE.getPlayerCache().getInventoryCache().getOpenContainer();
         return countEmptyTopSlots(container, topSlots);
@@ -1815,6 +2316,43 @@ public class ChestScannerService {
             }
         }
         return count;
+    }
+
+    private int countCarriedRequestedShulkers(final Map<String, Integer> remaining) {
+        int count = 0;
+        for (final String itemId : remaining.keySet()) {
+            final int remainingForItem = remaining.getOrDefault(itemId, 0);
+            if (remainingForItem <= 0) {
+                continue;
+            }
+            count += Math.min(remainingForItem, countCarriedTargetShulkers(itemId));
+        }
+        return count;
+    }
+
+    private int totalRemaining(final Map<String, Integer> remaining) {
+        int total = 0;
+        for (final int count : remaining.values()) {
+            total += Math.max(0, count);
+        }
+        return total;
+    }
+
+    private String withdrawSummary(final WithdrawRequest request) {
+        if (request.items().size() <= 1) {
+            final WithdrawItem item = request.items().isEmpty()
+                ? new WithdrawItem(request.itemId(), request.shulkerCount(), request.candidateChestIds())
+                : request.items().getFirst();
+            return item.shulkerCount() + " shulker(s) of " + item.itemId();
+        }
+        final StringBuilder summary = new StringBuilder();
+        for (final WithdrawItem item : request.items()) {
+            if (!summary.isEmpty()) {
+                summary.append(", ");
+            }
+            summary.append(item.shulkerCount()).append(" shulker(s) of ").append(item.itemId());
+        }
+        return summary.toString();
     }
 
     private boolean isFullShulkerOfItem(final ItemStack stack, final String itemId) {
@@ -2136,26 +2674,14 @@ public class ChestScannerService {
         return dx * dx + dy * dy + dz * dz;
     }
 
-    private boolean openChestDirectly(final int[][] chestBlocks, final int[] preferredTarget) {
-        if (tryOpenChestBlock(preferredTarget)) {
-            return true;
-        }
-        for (final int[] chestBlock : chestBlocks) {
-            if (chestBlock == preferredTarget) {
-                continue;
-            }
-            if (tryOpenChestBlock(chestBlock)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private boolean tryOpenChestBlock(final int[] blockPos) {
         if (blockPos == null) {
             return false;
         }
         try {
+            if (!waitIfWithdrawPaused()) {
+                return false;
+            }
             final var rotation = RotationHelper.rotationTo(blockPos[0] + 0.5D, blockPos[1] + 0.5D, blockPos[2] + 0.5D);
             final float yaw = rotation.getX();
             final float pitch = rotation.getY();
@@ -2168,6 +2694,9 @@ public class ChestScannerService {
                 .build();
             INPUTS.submit(rotateOnly).get(2, TimeUnit.SECONDS);
 
+            if (!waitIfWithdrawPaused()) {
+                return false;
+            }
             final Block block = World.getBlock(blockPos[0], blockPos[1], blockPos[2]);
             if (block == null) {
                 return false;
@@ -2289,11 +2818,20 @@ public class ChestScannerService {
     }
 
     public void cancelScan() {
-        final boolean wasActive = scanActive;
+        final boolean wasActive = busyForNewWork();
         scanActive = false;
+        withdrawActive = false;
+        markerReturnActive = false;
+        markerReturnForPearlLoad = false;
         cancelRequested = true;
         pauseRequested = false;
+        withdrawPauseRequested = false;
+        synchronized (withdrawPauseMonitor) {
+            withdrawPausedForPearl = false;
+            withdrawPauseMonitor.notifyAll();
+        }
         BARITONE.stop();
+        stopDirectMovement();
         closeOpenContainerIfPresentSafely();
         clearScanLock();
         if (!wasActive) {
@@ -2304,10 +2842,13 @@ public class ChestScannerService {
     }
 
     public synchronized boolean pauseForPearlRequest() {
+        if (withdrawActive) {
+            return pauseWithdrawForPearlRequest();
+        }
+
         if (!scanActive) {
             return false;
         }
-
         pauseRequested = true;
         cancelRequested = false;
         scanActive = false;
@@ -2315,10 +2856,45 @@ public class ChestScannerService {
         closeOpenContainerIfPresentSafely();
         clearScanLock();
         waitForScanTaskToSettle(3L);
+        closeLateOpeningContainer("scan pause");
+        closeOpenContainerIfPresentSafely();
+        return true;
+    }
+
+    private boolean pauseWithdrawForPearlRequest() {
+        withdrawPauseRequested = true;
+        BARITONE.stop();
+        stopDirectMovement();
+        closeOpenContainerIfPresentSafely();
+        clearScanLock();
+
+        final long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(6L);
+        synchronized (withdrawPauseMonitor) {
+            while (withdrawActive && !withdrawPausedForPearl && System.currentTimeMillis() < deadline) {
+                try {
+                    withdrawPauseMonitor.wait(50L);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        if (!withdrawPausedForPearl && withdrawActive) {
+            PearlPlusPlugin.LOG.warn("Withdraw worker did not acknowledge pearl-load pause before timeout; continuing pearl load anyway");
+        }
         return true;
     }
 
     public synchronized boolean resumePausedScan() {
+        if (withdrawPauseRequested || withdrawPausedForPearl) {
+            withdrawPauseRequested = false;
+            synchronized (withdrawPauseMonitor) {
+                withdrawPauseMonitor.notifyAll();
+            }
+            PearlPlusPlugin.LOG.info("Withdraw worker resume requested after pearl load");
+            return true;
+        }
+
         if (scanActive || !hasPausedScan()) {
             return false;
         }
@@ -2359,7 +2935,7 @@ public class ChestScannerService {
     }
 
     public boolean isScanActive() {
-        return scanActive || withdrawActive;
+        return scanActive || withdrawActive || markerReturnActive;
     }
 
     public boolean isScanPaused() {
@@ -2377,6 +2953,7 @@ public class ChestScannerService {
     }
 
     public void shutdown() {
+        cancelScan();
         stopWithdrawWorker();
         clearScanLock();
         withdrawExecutor.shutdownNow();

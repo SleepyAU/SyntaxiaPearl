@@ -109,6 +109,10 @@ public class ChestScannerModule extends Module {
         return scanner != null && scanner.isScanActive();
     }
 
+    public boolean isScanPaused() {
+        return scanner != null && scanner.isScanPaused();
+    }
+
     public String status() {
         if (!PLUGIN_CONFIG.scanner.enabled) {
             return "Scanner disabled";
@@ -141,6 +145,10 @@ public class ChestScannerModule extends Module {
 
     public boolean returnToMarker() {
         return scanner != null && scanner.returnToConfiguredMarker();
+    }
+
+    public boolean returnPausedScannerToMarkerForPearlLoad() {
+        return scanner != null && scanner.returnPausedScannerToMarkerForPearlLoad();
     }
 
     public boolean clearRemoteStashData() {

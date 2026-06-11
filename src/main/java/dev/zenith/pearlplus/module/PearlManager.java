@@ -48,6 +48,8 @@ public class PearlManager {
     private static final double HOME_REACHED_DISTANCE_SQ = 1.0D;
     private static final long TRAPDOOR_SEQUENCE_DELAY_MS = 75L;
     private static final long ACTION_TIMEOUT_MS = 15_000L;
+    private static final long PAUSED_SCANNER_HOME_WAIT_MS = 45_000L;
+    private static final long HOME_SETTLE_WAIT_MS = 1_500L;
     private static final int LECTERN_OPEN_MAX_TICKS = 60;
     private static final int LECTERN_CLOSE_MAX_TICKS = 40;
     private static final Path EXTERNAL_ACTION_LOCK = Path.of(System.getProperty("java.io.tmpdir"), "syntaxia-chest-scan-active.lock");
@@ -106,7 +108,7 @@ public class PearlManager {
     private boolean scannerBusy() {
         try {
             ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
-            return scannerModule != null && scannerModule.isScanActive();
+            return scannerModule != null && (scannerModule.isScanActive() || scannerModule.isScanPaused());
         } catch (final Exception e) {
             return false;
         }
@@ -150,15 +152,23 @@ public class PearlManager {
         if (resumeScannerAfterAction) {
             return false;
         }
+        boolean reservedScannerResume = false;
         try {
             ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            if (scannerModule == null) {
+                return false;
+            }
+            resumeScannerAfterAction = true;
+            reservedScannerResume = true;
             if (scannerModule != null && scannerModule.pauseForPearlRequest()) {
-                resumeScannerAfterAction = true;
                 info("Paused chest indexing for pearl load request");
                 return true;
             }
         } catch (final Exception e) {
             LOG.warn("Failed to pause chest scanner for pearl load", e);
+        }
+        if (reservedScannerResume) {
+            resumeScannerAfterAction = false;
         }
         return false;
     }
@@ -176,6 +186,54 @@ public class PearlManager {
         } catch (final Exception e) {
             LOG.warn("Failed to resume chest scanner after pearl load", e);
         }
+    }
+
+    private boolean returnPausedScannerBeforePearlLoad() {
+        if (!resumeScannerAfterAction || isAtConfiguredHome()) {
+            return true;
+        }
+
+        boolean markerReturnAttempted = false;
+        try {
+            ChestScannerModule scannerModule = MODULE.get(ChestScannerModule.class);
+            if (scannerModule != null) {
+                markerReturnAttempted = true;
+                if (scannerModule.returnPausedScannerToMarkerForPearlLoad() && waitUntilConfiguredHome(HOME_SETTLE_WAIT_MS)) {
+                    info("Returned from paused chest indexing path before pearl load");
+                    return true;
+                }
+                info("Scanner marker return before pearl load did not confirm home position yet");
+            }
+        } catch (final Exception e) {
+            LOG.warn("Failed returning from paused scanner before pearl load", e);
+        }
+
+        if (waitUntilConfiguredHome(markerReturnAttempted ? PAUSED_SCANNER_HOME_WAIT_MS : HOME_SETTLE_WAIT_MS)) {
+            info("Confirmed home position before pearl load");
+            return true;
+        }
+
+        notifier.discordAndIngameNotification(Embed.builder()
+                .title("Can't Load Pearl")
+                .description("Chest indexing paused, but the bot could not return home before loading.")
+                .errorColor());
+        return false;
+    }
+
+    private boolean waitUntilConfiguredHome(final long timeoutMs) {
+        final long deadline = System.currentTimeMillis() + Math.max(0L, timeoutMs);
+        while (System.currentTimeMillis() <= deadline) {
+            if (isAtConfiguredHome()) {
+                return true;
+            }
+            try {
+                Thread.sleep(100L);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return isAtConfiguredHome();
+            }
+        }
+        return isAtConfiguredHome();
     }
 
     public Optional<PlayerPearl> findPearl(UUID ownerUuid, String pearlId) {
@@ -924,7 +982,6 @@ public class PearlManager {
         }
         if (actionInProgress) {
             info("Ignoring pearl load request while another SyntaxPearl action is already running");
-            resumeScannerAfterPearlLoad();
             return;
         }
         Proxy proxy = Proxy.getInstance();
@@ -946,6 +1003,10 @@ public class PearlManager {
         }
 
         pauseScannerForPearlLoad();
+        if (!returnPausedScannerBeforePearlLoad()) {
+            resumeScannerAfterPearlLoad();
+            return;
+        }
 
         Optional<ChamberLookup.Hit> lecternHit = lecternFor(pearl);
         if (lecternHit.isPresent()) {
@@ -1309,6 +1370,9 @@ public class PearlManager {
             completeAction();
         }
         if (!PLUGIN_CONFIG.autoLoad.returnHomeEnabled || !hasConfiguredHome()) {
+            return;
+        }
+        if (resumeScannerAfterAction) {
             return;
         }
         if (actionInProgress || now - lastIdleHomeAttemptMs < IDLE_HOME_INTERVAL_MS) {
